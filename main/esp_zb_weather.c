@@ -525,21 +525,29 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
         message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
         message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
         
+        ESP_LOGI(TAG, "🔧 LED debug control message received on endpoint %d", HA_ESP_LED_DEBUG_ENDPOINT);
+        
         if (message->attribute.data.size == sizeof(bool)) {
             bool new_state = *(bool*)message->attribute.data.value;
+            bool prev_state = led_debug_enabled;
             led_debug_enabled = new_state;
+            
+            ESP_LOGI(TAG, "💡 LED debug switch: %s → %s via Zigbee", 
+                     prev_state ? "ON" : "OFF", 
+                     new_state ? "ON" : "OFF");
             
             /* Update the LED immediately based on new state and network status */
             if (led_debug_enabled) {
                 /* Re-enable LED, set to current network state */
                 debug_led_set(zigbee_network_connected);
+                ESP_LOGI(TAG, "✅ LED debug enabled - LED set to %s", 
+                         zigbee_network_connected ? "BLUE (connected)" : "OFF (disconnected)");
             } else {
                 /* Disable LED - turn it off */
                 debug_led_stop_blink();
                 debug_led_set(false);
+                ESP_LOGI(TAG, "❌ LED debug disabled - LED turned OFF");
             }
-            
-            ESP_LOGI(TAG, "💡 LED debug %s via Zigbee", led_debug_enabled ? "enabled" : "disabled");
         } else {
             ESP_LOGW(TAG, "Invalid data size for LED debug control: %d", message->attribute.data.size);
             ret = ESP_ERR_INVALID_SIZE;
