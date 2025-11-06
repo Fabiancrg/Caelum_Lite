@@ -16,6 +16,23 @@ const fzRainfall = {
     },
 };
 
+const fzBattery = {
+    cluster: 'genPowerCfg',
+    type: ['attributeReport', 'readResponse'],
+    convert: (model, msg, publish, options, meta) => {
+        const result = {};
+        if (msg.data.hasOwnProperty('batteryVoltage')) {
+            // Battery voltage in 0.1V units (e.g., 41 = 4.1V)
+            result.voltage = msg.data.batteryVoltage * 100; // Convert to mV
+        }
+        if (msg.data.hasOwnProperty('batteryPercentageRemaining')) {
+            // Battery percentage in 0-200 scale (200 = 100%)
+            result.battery = Math.round(msg.data.batteryPercentageRemaining / 2);
+        }
+        return result;
+    },
+};
+
 export default {
     zigbeeModel: ['caelum'],
     model: 'caelum',
@@ -26,7 +43,7 @@ export default {
         m.temperature(),
         m.humidity(),
         m.pressure(),
-        m.battery(),  // Add battery monitoring
+        // Battery monitoring is handled manually via Power Configuration cluster
         m.numeric({
             "name": "rainfall",
             "cluster": "genAnalogInput",
@@ -52,6 +69,26 @@ export default {
             "valueMax": 7200
         })
     ],
-    fromZigbee: [fzRainfall],
+    fromZigbee: [fzRainfall, fzBattery],
+    exposes: [
+        {
+            type: 'numeric',
+            name: 'battery',
+            property: 'battery',
+            description: 'Battery percentage',
+            unit: '%',
+            access: 1, // Read-only
+            valueMin: 0,
+            valueMax: 100
+        },
+        {
+            type: 'numeric',
+            name: 'voltage',
+            property: 'voltage',
+            description: 'Battery voltage',
+            unit: 'mV',
+            access: 1, // Read-only
+        }
+    ],
     ota: true,
 };

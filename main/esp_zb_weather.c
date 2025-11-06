@@ -998,11 +998,15 @@ static const char *BATTERY_TAG = "BATTERY";
 
 #define BATTERY_ADC_CHANNEL     ADC_CHANNEL_4    // GPIO4 on ESP32-H2
 #define BATTERY_ADC_UNIT        ADC_UNIT_1       // ADC1 on ESP32-H2
-#define BATTERY_ADC_ATTEN       ADC_ATTEN_DB_12  // 0-3.1V range (covers 0-2.1V from divider)
+#define BATTERY_ADC_ATTEN       ADC_ATTEN_DB_12  // 0-3.1V range (ESP32-H2: actually 0-2.5V)
 
 // For Li-Ion battery monitoring via voltage divider:
-// Li-Ion cell: R1=100kΩ, R2=100kΩ → divider = 2.0
-#define BATTERY_VOLTAGE_DIVIDER 2.0f             // 2.0 for cell monitoring (R1=R2=100kΩ)
+// Hardware: R1=99kΩ, R2=99.1kΩ → theoretical divider = 2.0
+// However, ESP32-H2 ADC calibration has issues with DB_12 attenuation
+// Empirical calibration: ADC reads 1300mV when actual is 2085mV
+// Correction factor: 2085/1300 = 1.604
+#define BATTERY_VOLTAGE_DIVIDER 2.0f             // Hardware divider (R1≈R2≈100kΩ)
+#define BATTERY_ADC_CORRECTION  1.604f           // ADC calibration correction for ESP32-H2
 #define BATTERY_MIN_VOLTAGE     2.7f             // Li-Ion minimum safe voltage (V)
 #define BATTERY_MAX_VOLTAGE     4.2f             // Li-Ion maximum voltage (V)
 
@@ -1083,6 +1087,7 @@ static void battery_read_and_report(uint8_t param)
         // Read ADC multiple times and average for better accuracy
         const int num_samples = 10;
         int voltage_sum = 0;
+        int raw_sum = 0;
         
         for (int i = 0; i < num_samples; i++) {
             int adc_raw;
@@ -1093,17 +1098,22 @@ static void battery_read_and_report(uint8_t param)
                 goto skip_adc;
             }
             
+            raw_sum += adc_raw;  // Track raw ADC values for debugging
+            
             int voltage_mv;
             if (adc_cali_handle != NULL) {
                 ret = adc_cali_raw_to_voltage(adc_cali_handle, adc_raw, &voltage_mv);
                 if (ret != ESP_OK) {
                     ESP_LOGE(BATTERY_TAG, "ADC calibration failed: %s", esp_err_to_name(ret));
-                    // Fallback: rough calculation without calibration
-                    voltage_mv = (adc_raw * 3100) / 4095;  // Assuming 3.1V max with DB_12 attenuation
+                    // Fallback: rough calculation
+                    voltage_mv = (adc_raw * 2500) / 4095;
                 }
+                // Apply ESP32-H2 ADC correction factor (empirically determined)
+                voltage_mv = (int)((float)voltage_mv * BATTERY_ADC_CORRECTION);
             } else {
                 // No calibration available
-                voltage_mv = (adc_raw * 3100) / 4095;
+                voltage_mv = (adc_raw * 2500) / 4095;
+                voltage_mv = (int)((float)voltage_mv * BATTERY_ADC_CORRECTION);
             }
             
             voltage_sum += voltage_mv;
@@ -1112,12 +1122,13 @@ static void battery_read_and_report(uint8_t param)
         
         // Calculate average voltage at ADC input (in volts)
         float adc_voltage = (voltage_sum / num_samples) / 1000.0f;
+        int avg_raw = raw_sum / num_samples;
         
         // Apply voltage divider multiplier to get actual battery voltage
         battery_voltage = adc_voltage * BATTERY_VOLTAGE_DIVIDER;
         
-        ESP_LOGI(BATTERY_TAG, "📊 ADC: %.3fV (raw avg: %dmV) → Battery: %.2fV", 
-                 adc_voltage, voltage_sum / num_samples, battery_voltage);
+        ESP_LOGI(BATTERY_TAG, "📊 ADC raw avg: %d, calibrated: %dmV (%.3fV) → Battery: %.2fV", 
+                 avg_raw, voltage_sum / num_samples, adc_voltage, battery_voltage);
     }
     
 skip_adc:
