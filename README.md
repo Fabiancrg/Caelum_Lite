@@ -29,7 +29,7 @@ This project is based on the examples provided in the ESP Zigbee SDK:
 
 ### 📋 Detailed Endpoint Descriptions
 
-#### **Endpoint 1: Environmental Monitoring**
+#### **Endpoint 1: Environmental Monitoring & Power Management**
 - **Hardware**: BME280 sensor via I2C
   - **ESP32-H2**: SDA: GPIO10, SCL: GPIO11
   - **ESP32-C6**: SDA: GPIO6, SCL: GPIO7
@@ -37,8 +37,15 @@ This project is based on the examples provided in the ESP Zigbee SDK:
   - 🌡️ **Temperature**: -40°C to +85°C (±1°C accuracy)
   - 💧 **Humidity**: 0-100% RH (±3% accuracy) 
   - 🌪️ **Pressure**: 300-1100 hPa (±1 hPa accuracy)
+  - 🔋 **Battery Monitoring**: Li-Ion voltage (2.7V-4.2V) and percentage
+- **Battery Monitoring**:
+  - **Hardware**: GPIO4 (ADC1_CH4) with voltage divider (2x 100kΩ resistors)
+  - **Voltage**: Real-time battery voltage in 0.1V units
+  - **Percentage**: Battery level 0-100% based on Li-Ion discharge curve
+  - **Calibration**: ESP32-H2 ADC correction factor (1.604x) for accurate readings
+  - **Power Configuration Cluster**: Standard Zigbee battery attributes
 - **Features**: Automatic reporting during wake cycles, Zigbee-standard units
-- **Use Case**: Weather monitoring, HVAC automation, air quality tracking
+- **Use Case**: Weather monitoring, HVAC automation, air quality tracking, battery-powered applications
 
 #### **Endpoint 2: Rain Gauge System**
 - **Hardware**: Tipping bucket rain gauge with reed switch
@@ -76,12 +83,15 @@ This project is based on the examples provided in the ESP Zigbee SDK:
 - ESP32-C6 or ESP32-H2 development board
 - BME280 environmental sensor module
 - Tipping bucket rain gauge with reed switch
+- Li-Ion battery (with protection circuit, 5V output recommended)
+- Voltage divider (2x 100kΩ resistors for battery monitoring)
 - Zigbee coordinator (ESP32-H2 or commercial gateway)
 
 #### **Pin Assignments**
 
 **ESP32-H2 (Recommended)**
 ```
+GPIO 4  - Battery voltage input (ADC1_CH4 with voltage divider)
 GPIO 10 - I2C SDA (BME280)
 GPIO 11 - I2C SCL (BME280) 
 GPIO 12 - Rain gauge input (RTC-capable)*
@@ -90,6 +100,7 @@ GPIO 9  - Built-in button (factory reset)
 
 **ESP32-C6**
 ```
+GPIO 4  - Battery voltage input (ADC1_CH4 with voltage divider)
 GPIO 5  - Rain gauge input (RTC-capable)*
 GPIO 6  - I2C SDA (BME280)
 GPIO 7  - I2C SCL (BME280) 
@@ -97,6 +108,16 @@ GPIO 9  - Built-in button (factory reset)
 ```
 
 *Both targets now use RTC-capable GPIO pins for rain detection during deep sleep
+
+**Battery Voltage Divider Circuit**
+```
+Battery+ ──┬── 100kΩ ──┬── 100kΩ ── GND
+           │           │
+           │           └── GPIO4 (ADC input)
+           │
+           └── 5V output (to ESP32 power)
+```
+Note: Voltage divider monitors the cell voltage (2.7V-4.2V) while the battery pack provides 5V regulated output
 
 ### � Zigbee Integration
 - **Protocol**: Zigbee 3.0  
@@ -203,9 +224,10 @@ I (3568) RAIN_GAUGE: Rain gauge enabled - device connected to Zigbee network
 I (8000) WEATHER_STATION: 🌡️ Temperature: 22.35°C reported to Zigbee  
 I (8010) WEATHER_STATION: 💧 Humidity: 45.20% reported to Zigbee
 I (8020) WEATHER_STATION: 🌪️ Pressure: 1013.25 hPa reported to Zigbee
-I (8030) WEATHER_STATION: 📡 Temp: 22.4°C
-I (8040) WEATHER_STATION: 📡 Humidity: 45.2%
-I (8050) WEATHER_STATION: 📡 Pressure: 1013.3 hPa
+I (8030) BATTERY: 🔋 Li-Ion Battery: 4.17V (98%) - Zigbee values: 41 (0.1V), 196 (%*2)
+I (8040) WEATHER_STATION: 📡 Temp: 22.4°C
+I (8050) WEATHER_STATION: 📡 Humidity: 45.2%
+I (8060) WEATHER_STATION: 📡 Pressure: 1013.3 hPa
 ```
 
 ### Rain Gauge Activity
@@ -226,7 +248,8 @@ I (18010) WEATHER_STATION: 💤 Entering deep sleep for 900 seconds (15 minutes)
 
 When connected to Zigbee2MQTT or other Zigbee coordinators, the device appears as:
 
-- **3x Sensor entities**: Temperature, Humidity, Pressure  
+- **4x Sensor entities**: Temperature, Humidity, Pressure, Battery Percentage
+- **1x Sensor entity**: Battery Voltage (mV)
 - **1x Sensor entity**: Rainfall total with automatic updates
 - **1x Number entity**: Sleep duration control (60-7200 seconds)
 
@@ -295,6 +318,14 @@ WeatherStation/
 - **ESP32-C6**: Check I2C connections (SDA: GPIO6, SCL: GPIO7)
 - Verify BME280 I2C address (default: 0x76 or 0x77)
 - Ensure proper power supply to sensor (3.3V)
+
+#### **Battery Monitoring Issues**
+- Verify voltage divider connections (2x 100kΩ resistors to GPIO4)
+- Check battery cell voltage tap (should be 2.7V-4.2V at divider output)
+- Ensure GPIO4 (ADC1_CH4) is properly configured
+- Monitor serial output for ADC calibration messages
+- **ESP32-H2 ADC quirk**: Uses empirical correction factor (1.604x) for DB_12 attenuation
+- Battery percentage calculated from voltage (2.7V=0%, 4.2V=100%)
 
 #### **Zigbee Connection Issues**
 - Perform factory reset with long press (5s) on built-in button
