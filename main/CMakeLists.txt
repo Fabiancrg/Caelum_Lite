@@ -3,3 +3,6 @@ idf_component_register(
     INCLUDE_DIRS "." "C:/Users/fabia/esp/v5.5.1/esp-idf/examples/zigbee/common/zcl_utility/include"
     PRIV_REQUIRES nvs_flash esp_driver_uart ieee802154 app_update esp_adc
 )
+
+# Make generated build-time header visible to this component
+target_include_directories(${COMPONENT_LIB} PRIVATE "${CMAKE_BINARY_DIR}/generated")

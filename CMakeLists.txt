@@ -10,8 +10,8 @@ idf_build_set_property(MINIMAL_BUILD ON)
 project(caelum)
 
 # Version configuration
-set(PROJECT_VER "0.2")
-set(BUILD_NUMBER 0)
+set(PROJECT_VER "1.1")
+set(BUILD_NUMBER 10)
 set(MANUFACTURER_CODE "0xFABC")
 set(IMAGE_TYPE "0x1200")
 set(ZIGBEE_STACK_VERSION "0x0003")  # Zigbee 3.0
@@ -37,21 +37,12 @@ endforeach()
 # Generate date code
 string(TIMESTAMP DATE_CODE "%Y%m%d")
 
-# Add compile definitions
-add_compile_definitions(
-	FW_VERSION="${PROJECT_VER}.${BUILD_NUMBER}"
-	FW_DATE_CODE="${DATE_CODE}"
-	FW_VERSION_MAJOR=${_ver_major}
-    FW_VERSION_MINOR=${_ver_minor}
-    FW_VERSION_PATCH=${BUILD_NUMBER}
-    OTA_FILE_VERSION=${OTA_VERSION_DEC}
-    OTA_MANUFACTURER=${MANUFACTURER_CODE}
-    OTA_IMAGE_TYPE=${IMAGE_TYPE}
-    ZB_STACK_VERSION=${ZIGBEE_STACK_VERSION}
-)
+# Generate a small header with version macros so components can include a single
+# header (works reliably across IDF/CMake versions and component layouts).
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated")
+configure_file(${CMAKE_SOURCE_DIR}/version.h.in ${CMAKE_BINARY_DIR}/generated/version.h @ONLY)
 
-
-
+# (Top-level compile defs removed - version header is generated and used by components)
 # Find Python
 find_package(Python3 REQUIRED)
 

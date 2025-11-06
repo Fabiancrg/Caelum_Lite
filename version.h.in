@@ -1,0 +1,18 @@
+#ifndef GENERATED_VERSION_H
+#define GENERATED_VERSION_H
+
+/* Generated version header - do not edit by hand */
+
+#define FW_VERSION "@PROJECT_VER@.@BUILD_NUMBER@"
+#define FW_DATE_CODE "@DATE_CODE@"
+
+#define FW_VERSION_MAJOR @_ver_major@
+#define FW_VERSION_MINOR @_ver_minor@
+#define FW_VERSION_PATCH @BUILD_NUMBER@
+
+#define OTA_FILE_VERSION @OTA_VERSION_DEC@
+#define OTA_MANUFACTURER @MANUFACTURER_CODE@
+#define OTA_IMAGE_TYPE @IMAGE_TYPE@
+#define ZB_STACK_VERSION @ZIGBEE_STACK_VERSION@
+
+#endif /* GENERATED_VERSION_H */

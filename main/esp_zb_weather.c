@@ -26,13 +26,17 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
+#include "esp_ota_ops.h"
+#include "esp_app_format.h"
+/* Generated header with FW_VERSION / FW_DATE_CODE - created at configure time */
+#include "version.h"
 
-/* Define multistate input cluster constants if not available */
-#ifndef ESP_ZB_ZCL_CLUSTER_ID_MULTISTATE_INPUT
-#define ESP_ZB_ZCL_CLUSTER_ID_MULTISTATE_INPUT                0x0012U
+/* OTA upgrade running versions */
+#ifndef OTA_UPGRADE_RUNNING_FILE_VERSION
+#define OTA_UPGRADE_RUNNING_FILE_VERSION                      0x00000000U
 #endif
-#ifndef ESP_ZB_ZCL_ATTR_MULTISTATE_INPUT_PRESENT_VALUE_ID
-#define ESP_ZB_ZCL_ATTR_MULTISTATE_INPUT_PRESENT_VALUE_ID     0x0055U
+#ifndef OTA_UPGRADE_RUNNING_STACK_VERSION
+#define OTA_UPGRADE_RUNNING_STACK_VERSION                     0x0002U
 #endif
 
 #if !defined ZB_ED_ROLE
@@ -377,6 +381,14 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
  */
 static void prepare_for_deep_sleep(uint8_t param)
 {
+    /* Check if OTA upgrade is in progress */
+    if (esp_zb_ota_is_active()) {
+        ESP_LOGW(TAG, "⚠️ OTA upgrade in progress, postponing deep sleep...");
+        /* Reschedule sleep check in 30 seconds */
+        esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 30000);
+        return;
+    }
+    
     ESP_LOGI(TAG, "✅ Zigbee operations complete, preparing for deep sleep...");
     
     /* Force final sensor reporting before sleep */
@@ -454,6 +466,14 @@ static void check_ota_status(uint8_t param)
     }
 }
 
+// Helper to fill a Zigbee ZCL string (first byte = length, then chars)
+static void fill_zcl_string(char *buf, size_t bufsize, const char *src) {
+    size_t len = strlen(src);
+    if (len > bufsize - 1) len = bufsize - 1; // Reserve 1 byte for length
+    buf[0] = (uint8_t)len;
+    memcpy(&buf[1], src, len);
+}
+
 static void esp_zb_task(void *pvParameters)
 {
     /* initialize Zigbee stack */
@@ -470,9 +490,43 @@ static void esp_zb_task(void *pvParameters)
     /* Create Basic cluster for BME280 endpoint */
     esp_zb_basic_cluster_cfg_t basic_bme280_cfg = {
         .zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
-        .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,
+        .power_source = 0x03,  // 0x03 = Battery
     };
     esp_zb_attribute_list_t *esp_zb_basic_bme280_cluster = esp_zb_basic_cluster_create(&basic_bme280_cfg);
+    
+    /* Add optional Basic cluster attributes for Zigbee2MQTT */
+#ifdef FW_VERSION_MAJOR
+    int ver_major = FW_VERSION_MAJOR;
+    int ver_minor = FW_VERSION_MINOR;
+#else
+    int ver_major = 1, ver_minor = 1;
+#endif
+    
+    // Encode version as (major << 4) | minor for Zigbee compatibility
+    uint8_t app_version = (ver_major << 4) | ver_minor;  // e.g., 1.1 = 0x11
+    
+#ifdef ZB_STACK_VERSION
+    uint8_t stack_version = (ZB_STACK_VERSION << 4) | 0;
+#else
+    uint8_t stack_version = 0x30; // Zigbee 3.0
+#endif
+    
+    // Use CMake-injected version and date for Zigbee attributes
+    char date_code[17];      // 16 chars max for Zigbee date code
+    char sw_build_id[17];    // 16 chars max for Zigbee sw_build_id
+    uint8_t hw_version = 1;
+    
+/* Use generated version.h values (configure_file -> build/generated/version.h) */
+    ESP_LOGI(TAG, "Using generated version: FW_VERSION=%s, FW_DATE_CODE=%s", FW_VERSION, FW_DATE_CODE);
+    fill_zcl_string(date_code, sizeof(date_code), FW_DATE_CODE);
+    fill_zcl_string(sw_build_id, sizeof(sw_build_id), FW_VERSION);
+    
+    esp_zb_basic_cluster_add_attr(esp_zb_basic_bme280_cluster, ESP_ZB_ZCL_ATTR_BASIC_APPLICATION_VERSION_ID, &app_version);
+    esp_zb_basic_cluster_add_attr(esp_zb_basic_bme280_cluster, ESP_ZB_ZCL_ATTR_BASIC_STACK_VERSION_ID, &stack_version);
+    esp_zb_basic_cluster_add_attr(esp_zb_basic_bme280_cluster, ESP_ZB_ZCL_ATTR_BASIC_HW_VERSION_ID, &hw_version);
+    esp_zb_basic_cluster_add_attr(esp_zb_basic_bme280_cluster, ESP_ZB_ZCL_ATTR_BASIC_DATE_CODE_ID, (void*)date_code);
+    esp_zb_basic_cluster_add_attr(esp_zb_basic_bme280_cluster, ESP_ZB_ZCL_ATTR_BASIC_SW_BUILD_ID, (void*)sw_build_id);
+    
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_basic_cluster(esp_zb_bme280_clusters, esp_zb_basic_bme280_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
     
     /* Create Temperature measurement cluster */
@@ -527,6 +581,45 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_power_config_cluster_add_attr(esp_zb_power_cluster, 0x0036, &battery_voltage_min_threshold);      // Battery Voltage Min Threshold
     
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_power_config_cluster(esp_zb_bme280_clusters, esp_zb_power_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+
+    /* Add OTA client cluster to BME280 endpoint for firmware updates */
+#ifdef OTA_FILE_VERSION
+    uint32_t ota_file_version = OTA_FILE_VERSION;
+#else
+    uint32_t ota_file_version = esp_zb_ota_get_fw_version();
+#endif
+    
+    esp_zb_ota_cluster_cfg_t ota_cluster_cfg = {
+        .ota_upgrade_file_version = ota_file_version,
+        .ota_upgrade_manufacturer = OTA_UPGRADE_MANUFACTURER,
+        .ota_upgrade_image_type = OTA_UPGRADE_IMAGE_TYPE,
+        .ota_upgrade_downloaded_file_ver = 0xFFFFFFFF,    // No pending update
+    };
+    esp_zb_attribute_list_t *esp_zb_ota_client_cluster = esp_zb_ota_cluster_create(&ota_cluster_cfg);
+    
+    /* Add OTA cluster attributes for Zigbee2MQTT OTA version display */
+    uint32_t current_file_version = ota_cluster_cfg.ota_upgrade_file_version;
+    // Note: Attribute 0x0002 (currentZigbeeStackVersion) is managed by the Zigbee stack - don't add manually!
+    esp_zb_ota_cluster_add_attr(esp_zb_ota_client_cluster, 0x0003, &current_file_version); // currentFileVersion
+    
+    /* Add client-specific OTA attributes */
+    esp_zb_zcl_ota_upgrade_client_variable_t client_vars = {
+        .timer_query = ESP_ZB_ZCL_OTA_UPGRADE_QUERY_TIMER_COUNT_DEF,
+        .hw_version = 0x0101,
+        .max_data_size = 223,
+    };
+    esp_zb_ota_cluster_add_attr(esp_zb_ota_client_cluster, ESP_ZB_ZCL_ATTR_OTA_UPGRADE_CLIENT_DATA_ID, &client_vars);
+    
+    /* Add server address and endpoint (broadcast initially) */
+    uint16_t server_addr = 0xffff;
+    esp_zb_ota_cluster_add_attr(esp_zb_ota_client_cluster, ESP_ZB_ZCL_ATTR_OTA_UPGRADE_SERVER_ADDR_ID, &server_addr);
+    
+    uint8_t server_ep = 0xff;
+    esp_zb_ota_cluster_add_attr(esp_zb_ota_client_cluster, ESP_ZB_ZCL_ATTR_OTA_UPGRADE_SERVER_ENDPOINT_ID, &server_ep);
+    
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_ota_cluster(esp_zb_bme280_clusters, esp_zb_ota_client_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE));
+    ESP_LOGI(TAG, "📦 OTA client cluster added to endpoint %d (version: 0x%08lX, mfr: 0x%04X, type: 0x%04X)", 
+             HA_ESP_BME280_ENDPOINT, ota_file_version, OTA_UPGRADE_MANUFACTURER, OTA_UPGRADE_IMAGE_TYPE);
 
     esp_zb_endpoint_config_t endpoint_bme280_config = {
         .endpoint = HA_ESP_BME280_ENDPOINT,
@@ -619,15 +712,6 @@ static void esp_zb_task(void *pvParameters)
     esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_ep_list, HA_ESP_BME280_ENDPOINT, &info);
     esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_ep_list, HA_ESP_RAIN_GAUGE_ENDPOINT, &info);
     esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_ep_list, HA_ESP_SLEEP_CONFIG_ENDPOINT, &info);
-
-    /* Add OTA cluster to BME280 endpoint for firmware updates */
-    esp_zb_ota_cluster_cfg_t ota_cluster_cfg = {
-        .ota_upgrade_manufacturer = OTA_UPGRADE_MANUFACTURER,
-        .ota_upgrade_image_type = OTA_UPGRADE_IMAGE_TYPE,
-    };
-    esp_zb_attribute_list_t *esp_zb_ota_client_cluster = esp_zb_ota_cluster_create(&ota_cluster_cfg);
-    ESP_ERROR_CHECK(esp_zb_cluster_list_add_ota_cluster(esp_zb_bme280_clusters, esp_zb_ota_client_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE));
-    ESP_LOGI(TAG, "📦 OTA cluster added to endpoint %d", HA_ESP_BME280_ENDPOINT);
 
     esp_zb_device_register(esp_zb_ep_list);
     esp_zb_core_action_handler_register(zb_action_handler);
@@ -1078,14 +1162,57 @@ static esp_err_t battery_adc_init(void)
 
 static void battery_read_and_report(uint8_t param)
 {
+    /* Power optimization: Read battery only once per hour (time-based) to save ~360µAh/day
+     * This ensures we read once per hour regardless of wake reason (rain vs timer).
+     * Uses NVS to persist timestamp across deep sleep. */
+    
+    const uint32_t BATTERY_READ_INTERVAL_SEC = 3600;  // 1 hour
+    static bool interval_checked = false;
+    
+    if (!interval_checked) {
+        interval_checked = true;
+        
+        // Get current time since boot (in seconds)
+        uint32_t current_time_sec = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+        
+        // Read last battery reading timestamp from NVS
+        nvs_handle_t nvs_handle;
+        esp_err_t err = nvs_open("storage", NVS_READONLY, &nvs_handle);
+        uint32_t last_battery_read_time = 0;
+        
+        if (err == ESP_OK) {
+            nvs_get_u32(nvs_handle, "batt_time", &last_battery_read_time);
+            nvs_close(nvs_handle);
+        }
+        
+        // Check if enough time has elapsed
+        uint32_t elapsed_sec = current_time_sec - last_battery_read_time;
+        
+        if (elapsed_sec < BATTERY_READ_INTERVAL_SEC) {
+            ESP_LOGD(BATTERY_TAG, "⏭️  Skipping battery read (%lu sec since last, need %lu)", 
+                     elapsed_sec, BATTERY_READ_INTERVAL_SEC);
+            return;  // Skip this reading
+        }
+        
+        // Time to read battery - update timestamp in NVS
+        err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+        if (err == ESP_OK) {
+            nvs_set_u32(nvs_handle, "batt_time", current_time_sec);
+            nvs_commit(nvs_handle);
+            nvs_close(nvs_handle);
+        }
+        
+        ESP_LOGI(BATTERY_TAG, "🔋 Reading battery (last read %lu sec ago)", elapsed_sec);
+    }
+    
     float battery_voltage = 0.0f;
     
     if (adc_handle == NULL) {
         ESP_LOGE(BATTERY_TAG, "ADC not initialized, using simulated value");
         battery_voltage = 3.7f;  // Fallback simulated value
     } else {
-        // Read ADC multiple times and average for better accuracy
-        const int num_samples = 10;
+        /* Power optimization: Reduced from 10 to 3 samples (saves ~70% ADC power) */
+        const int num_samples = 3;
         int voltage_sum = 0;
         int raw_sum = 0;
         
@@ -1117,7 +1244,7 @@ static void battery_read_and_report(uint8_t param)
             }
             
             voltage_sum += voltage_mv;
-            vTaskDelay(pdMS_TO_TICKS(10));  // Small delay between samples
+            /* Power optimization: Removed 10ms delay - ADC can sample back-to-back (saves ~90% overhead) */
         }
         
         // Calculate average voltage at ADC input (in volts)
@@ -1350,14 +1477,20 @@ void app_main(void)
     
     /* Start Zigbee task */
     ESP_LOGI(TAG, "🚀 Starting Caelum Weather Station (Battery Mode)");
-    ESP_LOGI(TAG, "📦 Firmware: %s (Build: %s)", FIRMWARE_VERSION_STRING, 
-#ifdef FW_DATE_CODE
-             FW_DATE_CODE
+    
+    /* Log firmware version from app description */
+    esp_app_desc_t app_desc_main;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (esp_ota_get_partition_description(running, &app_desc_main) == ESP_OK) {
+        ESP_LOGI(TAG, "📦 Firmware: %s (Date: %s %s)", app_desc_main.version, app_desc_main.date, app_desc_main.time);
+    }
+    
+#ifdef OTA_FILE_VERSION
+    ESP_LOGI(TAG, "⚙️  OTA: Version=0x%08lX, Manufacturer=0x%04X, ImageType=0x%04X", 
+             (unsigned long)OTA_FILE_VERSION, OTA_UPGRADE_MANUFACTURER, OTA_UPGRADE_IMAGE_TYPE);
 #else
-             "unknown"
-#endif
-    );
     ESP_LOGI(TAG, "⚙️  OTA: Manufacturer=0x%04X, ImageType=0x%04X", OTA_UPGRADE_MANUFACTURER, OTA_UPGRADE_IMAGE_TYPE);
+#endif
     ESP_LOGI(TAG, "Wake reason: %s", 
              wake_reason == WAKE_REASON_TIMER ? "TIMER" :
              wake_reason == WAKE_REASON_RAIN ? "RAIN" :

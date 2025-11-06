@@ -266,6 +266,12 @@ esp_zb_zcl_ota_upgrade_status_t esp_zb_ota_get_status(void)
  */
 uint32_t esp_zb_ota_get_fw_version(void)
 {
+#ifdef OTA_FILE_VERSION
+    // Use version from CMake (already in 0xMMmmpppp format)
+    ESP_LOGI(TAG, "Firmware version from CMake: " FW_VERSION " (0x%08lX)", (unsigned long)OTA_FILE_VERSION);
+    return OTA_FILE_VERSION;
+#else
+    // Fallback: parse from app description
     const esp_app_desc_t *app_desc = esp_app_get_description();
     uint32_t version = 0;
     if (app_desc) {
@@ -281,6 +287,7 @@ uint32_t esp_zb_ota_get_fw_version(void)
         }
     }
     return version;
+#endif
 }
 
 /**
