@@ -3,3 +3,9 @@ build/
 .idea/
 managed_components/
 Doc/
+PCB/lib/
+PCB/caelum/caelum-backups
+PCB/caelum/~*
+PCB/caelum/#*
+PCB/caelum/_*
+PCB/caelum/*cache

@@ -281,6 +281,10 @@ static const char *SLEEP_CONFIG_TAG = "SLEEP_CONFIG";
 #define SLEEP_CONFIG_NVS_KEY            "duration_sec"
 #define SLEEP_CONFIG_ATTR_ID            0x8000  // Custom attribute ID for sleep duration
 
+/* LED debug configuration persistence */
+#define LED_CONFIG_NVS_NAMESPACE        "led_config"
+#define LED_CONFIG_NVS_KEY              "debug_enabled"
+
 /* Network connection status (zigbee_network_connected declared earlier for LED functions) */
 static uint32_t connection_retry_count = 0;
 static bool sleep_scheduled = false;  // Track if sleep has been scheduled
@@ -297,6 +301,8 @@ static void prepare_for_light_sleep(uint8_t param);
 static void sed_wake_and_report(uint8_t param);
 static esp_err_t sleep_config_load(void);
 static esp_err_t sleep_config_save(void);
+static esp_err_t led_config_load(void);
+static esp_err_t led_config_save(void);
 static void rain_gauge_init(void);
 static void rain_gauge_isr_handler(void *arg);
 static void rain_gauge_task(void *arg);
@@ -359,6 +365,9 @@ static esp_err_t deferred_driver_init(void)
     
     /* Load sleep configuration */
     sleep_config_load();
+    
+    /* Load LED debug configuration */
+    led_config_load();
     
     return ESP_OK;
 }
@@ -570,6 +579,9 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
             bool new_state = *(bool*)message->attribute.data.value;
             bool prev_state = led_debug_enabled;
             led_debug_enabled = new_state;
+            
+            /* Save LED state to NVS for persistence across reboots */
+            led_config_save();
             
             ESP_LOGI(TAG, "💡 LED debug switch: %s → %s via Zigbee", 
                      prev_state ? "ON" : "OFF", 
@@ -1106,6 +1118,13 @@ static void bme280_read_and_report(uint8_t param)
     float temperature, humidity, pressure;
     esp_err_t ret;
     
+    /* Wake BME280 from sleep and trigger forced measurement */
+    ret = bme280_app_wake_and_measure();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to wake BME280 for measurement: %s", esp_err_to_name(ret));
+        /* Continue anyway - try to read cached values */
+    }
+    
     // Read temperature
     ret = bme280_app_read_temperature(&temperature);
     if (ret == ESP_OK) {
@@ -1160,6 +1179,9 @@ static void bme280_read_and_report(uint8_t param)
     } else {
         ESP_LOGE(TAG, "Failed to read pressure: %s", esp_err_to_name(ret));
     }
+    
+    /* BME280 automatically returns to sleep mode after forced measurement.
+     * No explicit sleep call needed - sensor is already in low-power state. */
     
     /* In SED mode with automatic sleep, schedule next periodic report.
      * Device will automatically sleep between reports when idle. */
@@ -1656,6 +1678,52 @@ static esp_err_t sleep_config_save(void)
         }
     } else {
         ESP_LOGE(SLEEP_CONFIG_TAG, "Failed to save sleep duration: %s", esp_err_to_name(err));
+    }
+
+    nvs_close(nvs_handle);
+    return err;
+}
+
+static esp_err_t led_config_load(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(LED_CONFIG_NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "No previous LED config found, using default (enabled)");
+        return ESP_OK;
+    }
+
+    uint8_t saved_state = 1;  // Default to enabled
+    err = nvs_get_u8(nvs_handle, LED_CONFIG_NVS_KEY, &saved_state);
+    if (err == ESP_OK) {
+        led_debug_enabled = (saved_state != 0);
+        ESP_LOGI(TAG, "📂 Loaded LED debug state: %s", led_debug_enabled ? "ON" : "OFF");
+    } else {
+        ESP_LOGI(TAG, "No LED config found, using default (enabled)");
+    }
+
+    nvs_close(nvs_handle);
+    return ESP_OK;
+}
+
+static esp_err_t led_config_save(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(LED_CONFIG_NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for LED config: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    uint8_t state_to_save = led_debug_enabled ? 1 : 0;
+    err = nvs_set_u8(nvs_handle, LED_CONFIG_NVS_KEY, state_to_save);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "💾 LED debug state saved: %s", led_debug_enabled ? "ON" : "OFF");
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to save LED config: %s", esp_err_to_name(err));
     }
 
     nvs_close(nvs_handle);
