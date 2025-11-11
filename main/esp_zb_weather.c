@@ -52,11 +52,12 @@ static const char *TAG = "WEATHER_STATION";
 /* Network connection status - declared early for LED functions */
 static bool zigbee_network_connected = false;
 
-#ifdef DEBUG_LED_ENABLE
-/* LED debug control - can be toggled via Zigbee endpoint 4 */
-static bool led_debug_enabled = true;  // Default ON, can be controlled via genOnOff cluster
+/* LED is used only during boot/join process:
+ * - Blink yellow/orange during network joining
+ * - Steady blue when successfully connected
+ * - Blink red after max connection retries failed
+ * After successful join, LED strip is deinitialized to save power */
 
-#if DEBUG_LED_TYPE_RGB
 #include "led_strip.h"
 
 /* Debug LED variables for RGB LED */
@@ -87,57 +88,31 @@ static void debug_led_init(void)
 
 static void debug_led_deinit(void)
 {
-    /* Deinitialize LED strip to power down RMT peripheral before sleep
-     * RMT peripheral consumes ~1-2mA when active, even with LED "off" */
+    /* Deinitialize LED strip to power down RMT peripheral
+     * Called after successful network join to save power */
     if (led_strip) {
         led_strip_clear(led_strip);  // Clear pixels first
         led_strip_del(led_strip);    // Delete LED strip handle (powers down RMT)
         led_strip = NULL;
-        ESP_LOGI(TAG, "🔌 RGB LED RMT peripheral powered down for sleep");
+        ESP_LOGI(TAG, "🔌 RGB LED RMT peripheral powered down (boot sequence complete)");
     }
 }
 
-static void debug_led_set(bool state)
+static void debug_led_set_blue(void)
 {
-    /* Reinitialize LED if it was deinitialized for sleep */
-    if (led_strip == NULL) {
-        debug_led_init();
-    }
-    
-    if (!led_debug_enabled) {
-        led_strip_clear(led_strip);
-        return;
-    }
-    if (state) {
-        /* Blue color for connected state */
+    /* Set steady blue for successful connection */
+    if (led_strip) {
         led_strip_set_pixel(led_strip, 0, 0, 0, 16);  // R=0, G=0, B=16 (dim blue)
-    } else {
-        /* Off */
-        led_strip_set_pixel(led_strip, 0, 0, 0, 0);
+        led_strip_refresh(led_strip);
     }
-    led_strip_refresh(led_strip);
-}
-
-static void debug_led_set_orange(void)
-{
-    /* Reinitialize LED if it was deinitialized for sleep */
-    if (led_strip == NULL) {
-        debug_led_init();
-    }
-    
-    if (!led_debug_enabled) {
-        led_strip_clear(led_strip);
-        return;
-    }
-    /* Orange color for network leave */
-    led_strip_set_pixel(led_strip, 0, 16, 8, 0);  // R=16, G=8, B=0 (dim orange)
-    led_strip_refresh(led_strip);
 }
 
 static void debug_led_blink_task(void *arg)
 {
     while (led_blink_task_running) {
-        /* Yellow blink for network joining */
+        if (!led_strip) break;  // Stop if LED was deinitialized
+        
+        /* Yellow/orange blink for network joining */
         led_strip_set_pixel(led_strip, 0, 16, 8, 0);  // R=16, G=8, B=0 (dim yellow/orange)
         led_strip_refresh(led_strip);
         vTaskDelay(pdMS_TO_TICKS(500));  // ON for 500ms
@@ -151,12 +126,7 @@ static void debug_led_blink_task(void *arg)
 
 static void debug_led_start_blink(void)
 {
-    /* Reinitialize LED if it was deinitialized for sleep */
-    if (led_strip == NULL) {
-        debug_led_init();
-    }
-    
-    if (!led_debug_enabled) return;
+    if (!led_strip) return;  // LED already deinitialized
     
     if (!led_blink_task_running) {
         led_blink_task_running = true;
@@ -176,110 +146,21 @@ static void debug_led_stop_blink(void)
     }
 }
 
-static void debug_led_rain_flash(void)
+static void debug_led_blink_red(void)
 {
-    /* Reinitialize LED if it was deinitialized for sleep */
-    if (led_strip == NULL) {
-        debug_led_init();
-    }
+    /* Blink red to indicate connection failure after max retries */
+    if (!led_strip) return;
     
-    if (!led_debug_enabled) return;
-    
-    /* Quick white flash for rain pulse (non-blocking) */
-    led_strip_set_pixel(led_strip, 0, 16, 16, 16);  // R=16, G=16, B=16 (dim white)
-    led_strip_refresh(led_strip);
-    vTaskDelay(pdMS_TO_TICKS(100));  // Flash for 100ms
-    /* Return to previous state: always solid blue if connected */
-    if (zigbee_network_connected) {
-        led_strip_set_pixel(led_strip, 0, 0, 0, 16);  // Back to blue (connected)
-    } else {
-        led_strip_set_pixel(led_strip, 0, 0, 0, 0);   // Back to off
-    }
-    led_strip_refresh(led_strip);
-}
-
-#else
-/* Debug LED variables for simple GPIO LED */
-static bool led_blink_task_running = false;
-static TaskHandle_t led_blink_task_handle = NULL;
-
-/* LED control functions */
-static void debug_led_init(void)
-{
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << DEBUG_LED_GPIO),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf);
-    gpio_set_level(DEBUG_LED_GPIO, 0);  // LED OFF initially
-    ESP_LOGI(TAG, "Debug LED initialized on GPIO%d", DEBUG_LED_GPIO);
-}
-
-static void debug_led_set(bool state)
-{
-    if (!led_debug_enabled) {
-        gpio_set_level(DEBUG_LED_GPIO, 0);
-        return;
-    }
-    gpio_set_level(DEBUG_LED_GPIO, state ? 1 : 0);
-}
-
-static void debug_led_blink_task(void *arg)
-{
-    while (led_blink_task_running) {
-        gpio_set_level(DEBUG_LED_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(500));  // ON for 500ms
-        gpio_set_level(DEBUG_LED_GPIO, 0);
-        vTaskDelay(pdMS_TO_TICKS(500));  // OFF for 500ms
-    }
-    vTaskDelete(NULL);
-}
-
-static void debug_led_start_blink(void)
-{
-    if (!led_debug_enabled) return;
-    
-    if (!led_blink_task_running) {
-        led_blink_task_running = true;
-        xTaskCreate(debug_led_blink_task, "led_blink", 2048, NULL, 5, &led_blink_task_handle);
-        ESP_LOGI(TAG, "LED blink started (network joining)");
+    for (int i = 0; i < 10; i++) {  // Blink 10 times
+        led_strip_set_pixel(led_strip, 0, 16, 0, 0);  // R=16, G=0, B=0 (dim red)
+        led_strip_refresh(led_strip);
+        vTaskDelay(pdMS_TO_TICKS(200));  // ON for 200ms
+        
+        led_strip_set_pixel(led_strip, 0, 0, 0, 0);   // OFF
+        led_strip_refresh(led_strip);
+        vTaskDelay(pdMS_TO_TICKS(200));  // OFF for 200ms
     }
 }
-
-static void debug_led_stop_blink(void)
-{
-    if (led_blink_task_running) {
-        led_blink_task_running = false;
-        if (led_blink_task_handle) {
-            vTaskDelay(pdMS_TO_TICKS(10));  // Give task time to exit
-            led_blink_task_handle = NULL;
-        }
-    }
-}
-
-static void debug_led_rain_flash(void)
-{
-    if (!led_debug_enabled) return;
-    
-    /* Quick flash for rain pulse (simple GPIO) */
-    gpio_set_level(DEBUG_LED_GPIO, 1);
-    vTaskDelay(pdMS_TO_TICKS(100));  // Flash for 100ms
-    
-    /* Return to previous state */
-    gpio_set_level(DEBUG_LED_GPIO, zigbee_network_connected ? 1 : 0);
-}
-#endif /* DEBUG_LED_TYPE_RGB */
-#else
-/* Dummy functions when LED debug is disabled */
-static inline void debug_led_init(void) {}
-static inline void debug_led_set(bool state) {}
-static inline void debug_led_start_blink(void) {}
-static inline void debug_led_stop_blink(void) {}
-static inline void debug_led_rain_flash(void) {}
-#endif /* DEBUG_LED_ENABLE */
 
 /* Rain gauge configuration */
 #ifdef CONFIG_IDF_TARGET_ESP32H2
@@ -313,10 +194,6 @@ static const char *SLEEP_CONFIG_TAG = "SLEEP_CONFIG";
 #define SLEEP_CONFIG_NVS_KEY            "duration_sec"
 #define SLEEP_CONFIG_ATTR_ID            0x8000  // Custom attribute ID for sleep duration
 
-/* LED debug configuration persistence */
-#define LED_CONFIG_NVS_NAMESPACE        "led_config"
-#define LED_CONFIG_NVS_KEY              "debug_enabled"
-
 /* Network connection status (zigbee_network_connected declared earlier for LED functions) */
 static uint32_t connection_retry_count = 0;
 #define NETWORK_RETRY_SLEEP_DURATION    30      // 30 seconds for network retry
@@ -330,8 +207,6 @@ static void factory_reset_device(uint8_t param);
 static void bme280_read_and_report(uint8_t param);
 static esp_err_t sleep_config_load(void);
 static esp_err_t sleep_config_save(void);
-static esp_err_t led_config_load(void);
-static esp_err_t led_config_save(void);
 static void rain_gauge_init(void);
 static void rain_gauge_isr_handler(void *arg);
 static void rain_gauge_task(void *arg);
@@ -395,9 +270,6 @@ static esp_err_t deferred_driver_init(void)
     /* Load sleep configuration */
     sleep_config_load();
     
-    /* Load LED debug configuration */
-    led_config_load();
-    
     return ESP_OK;
 }
 
@@ -450,7 +322,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     case ESP_ZB_ZDO_SIGNAL_LEAVE:
         ESP_LOGI(TAG, "Device is leaving the Zigbee network");
         debug_led_stop_blink();
-        debug_led_set_orange();
+        /* LED is already deinitialized after initial join, no action needed */
         zigbee_network_connected = false;
         rain_gauge_disable_isr();
         break;
@@ -493,8 +365,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                      extended_pan_id[3], extended_pan_id[2], extended_pan_id[1], extended_pan_id[0],
                      esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
             
-            debug_led_stop_blink();  // Stop blinking
-            debug_led_set(true);     // LED ON - connected
+            debug_led_stop_blink();       // Stop blinking
+            debug_led_set_blue();         // Set steady blue to indicate success
             
             /* Mark network as connected and reset retry count */
             zigbee_network_connected = true;
@@ -511,6 +383,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             esp_zb_scheduler_alarm((esp_zb_callback_t)battery_read_and_report, 0, 3000); // Report battery in 3 seconds
             esp_zb_scheduler_alarm((esp_zb_callback_t)sleep_duration_report, 0, 4000); // Report sleep duration in 4 seconds
             
+            /* Deinitialize LED after successful join - LED kept on for 5 seconds to confirm join, then powered down */
+            ESP_LOGI(TAG, "💡 LED will power down in 5 seconds to save battery");
+            esp_zb_scheduler_alarm((esp_zb_callback_t)debug_led_deinit, 0, 5000); // Power down LED in 5 seconds
+            
             /* Device will enter light sleep automatically when all initial reports complete */
             ESP_LOGI(TAG, "💤 Initial reports scheduled - device will sleep when idle");
         } else {
@@ -524,7 +400,18 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             rain_gauge_disable_isr();
             ESP_LOGW(RAIN_TAG, "Rain gauge disabled - not connected to network");
             
-            ESP_LOGW(TAG, "🔄 Connection attempt %d/%d failed", connection_retry_count, MAX_CONNECTION_RETRIES);
+            /* Check if max retries reached */
+            if (connection_retry_count >= MAX_CONNECTION_RETRIES) {
+                ESP_LOGE(TAG, "❌ Max connection retries (%d) reached - giving up", MAX_CONNECTION_RETRIES);
+                debug_led_stop_blink();
+                debug_led_blink_red();  // Blink red to indicate failure
+                /* LED will be deinitialized after red blink sequence completes */
+                esp_zb_scheduler_alarm((esp_zb_callback_t)debug_led_deinit, 0, 5000);
+                /* Device will continue to operate but won't retry network join */
+                break;
+            }
+            
+            ESP_LOGW(TAG, "🔄 Connection attempt %d/%d failed - retrying", connection_retry_count, MAX_CONNECTION_RETRIES);
             esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
         }
         break;
@@ -537,15 +424,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         }
         
         ESP_LOGI(TAG, "Zigbee can sleep");
-        #ifdef DEBUG_LED_ENABLE
-        /* CRITICAL: Power down LED hardware and RMT peripheral before sleep
-         * The RMT peripheral consumes ~1-2mA when active, even with LED "off" */
-        #if DEBUG_LED_TYPE_RGB
-        debug_led_deinit();  // Deinitialize LED strip and power down RMT peripheral
-        #else
-        gpio_set_level(DEBUG_LED_GPIO, 0);  // Turn off GPIO LED
-        #endif
-        #endif
+        /* LED is already deinitialized after successful join - no action needed */
         esp_zb_sleep_now();
         break;
     default:
@@ -593,43 +472,6 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
             }
         } else {
             ESP_LOGW(SLEEP_CONFIG_TAG, "Invalid data size for sleep duration: %d", message->attribute.data.size);
-            ret = ESP_ERR_INVALID_SIZE;
-        }
-    }
-    
-    /* Handle LED debug control via On/Off cluster on primary endpoint (EP1) */
-    if (message->info.dst_endpoint == HA_ESP_BME280_ENDPOINT && 
-        message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
-        message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
-        
-        ESP_LOGI(TAG, "🔧 LED debug control message received on primary endpoint %d", HA_ESP_BME280_ENDPOINT);
-        
-        if (message->attribute.data.size == sizeof(bool)) {
-            bool new_state = *(bool*)message->attribute.data.value;
-            bool prev_state = led_debug_enabled;
-            led_debug_enabled = new_state;
-            
-            /* Save LED state to NVS for persistence across reboots */
-            led_config_save();
-            
-            ESP_LOGI(TAG, "💡 LED debug switch: %s → %s via Zigbee", 
-                     prev_state ? "ON" : "OFF", 
-                     new_state ? "ON" : "OFF");
-            
-            /* Update the LED immediately based on new state and network status */
-            if (led_debug_enabled) {
-                /* Re-enable LED, set to current network state */
-                debug_led_set(zigbee_network_connected);
-                ESP_LOGI(TAG, "✅ LED debug enabled - LED set to %s", 
-                         zigbee_network_connected ? "BLUE (connected)" : "OFF (disconnected)");
-            } else {
-                /* Disable LED - turn it off */
-                debug_led_stop_blink();
-                debug_led_set(false);
-                ESP_LOGI(TAG, "❌ LED debug disabled - LED turned OFF");
-            }
-        } else {
-            ESP_LOGW(TAG, "Invalid data size for LED debug control: %d", message->attribute.data.size);
             ret = ESP_ERR_INVALID_SIZE;
         }
     }
@@ -886,18 +728,6 @@ static void esp_zb_task(void *pvParameters)
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_ota_cluster(esp_zb_bme280_clusters, esp_zb_ota_client_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE));
     ESP_LOGI(TAG, "📦 OTA client cluster added to endpoint %d (version: 0x%08lX, mfr: 0x%04X, type: 0x%04X)", 
              HA_ESP_BME280_ENDPOINT, ota_file_version, OTA_UPGRADE_MANUFACTURER, OTA_UPGRADE_IMAGE_TYPE);
-
-    /* Move LED debug On/Off control to primary endpoint (EP1).
-     * Some controllers probe the primary endpoint for common clusters; placing
-     * the genOnOff cluster on EP1 avoids UNSUPPORTED_CLUSTER responses when the
-     * controller queries EP1. This does not interfere with temperature/humidity/
-     * pressure clusters which remain on EP1 as separate clusters.
-     */
-    esp_zb_on_off_cluster_cfg_t onoff_cfg = {
-        .on_off = led_debug_enabled,
-    };
-    esp_zb_attribute_list_t *esp_zb_onoff_cluster = esp_zb_on_off_cluster_create(&onoff_cfg);
-    ESP_ERROR_CHECK(esp_zb_cluster_list_add_on_off_cluster(esp_zb_bme280_clusters, esp_zb_onoff_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
     esp_zb_endpoint_config_t endpoint_bme280_config = {
         .endpoint = HA_ESP_BME280_ENDPOINT,
@@ -1172,9 +1002,6 @@ static void rain_gauge_task(void *arg)
                     rain_pulse_count++;
                     total_rainfall_mm += RAIN_MM_PER_PULSE;
                     total_rainfall_mm = roundf(total_rainfall_mm * 100.0f) / 100.0f; // Round to 2 decimals
-                    
-                    /* Flash LED to indicate rain pulse */
-                    debug_led_rain_flash();
                     
                     ESP_LOGI(RAIN_TAG, "🌧️ Rain pulse #%u: %.2f mm total (+%.2f mm)",
                              rain_pulse_count, total_rainfall_mm, RAIN_MM_PER_PULSE);
@@ -1622,52 +1449,6 @@ static esp_err_t sleep_config_save(void)
     return err;
 }
 
-static esp_err_t led_config_load(void)
-{
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open(LED_CONFIG_NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGI(TAG, "No previous LED config found, using default (enabled)");
-        return ESP_OK;
-    }
-
-    uint8_t saved_state = 1;  // Default to enabled
-    err = nvs_get_u8(nvs_handle, LED_CONFIG_NVS_KEY, &saved_state);
-    if (err == ESP_OK) {
-        led_debug_enabled = (saved_state != 0);
-        ESP_LOGI(TAG, "📂 Loaded LED debug state: %s", led_debug_enabled ? "ON" : "OFF");
-    } else {
-        ESP_LOGI(TAG, "No LED config found, using default (enabled)");
-    }
-
-    nvs_close(nvs_handle);
-    return ESP_OK;
-}
-
-static esp_err_t led_config_save(void)
-{
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open(LED_CONFIG_NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS for LED config: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    uint8_t state_to_save = led_debug_enabled ? 1 : 0;
-    err = nvs_set_u8(nvs_handle, LED_CONFIG_NVS_KEY, state_to_save);
-    if (err == ESP_OK) {
-        err = nvs_commit(nvs_handle);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "💾 LED debug state saved: %s", led_debug_enabled ? "ON" : "OFF");
-        }
-    } else {
-        ESP_LOGE(TAG, "Failed to save LED config: %s", esp_err_to_name(err));
-    }
-
-    nvs_close(nvs_handle);
-    return err;
-}
-
 static void rain_gauge_init(void)
 {
     ESP_LOGI(RAIN_TAG, "Initializing rain gauge on GPIO%d (disabled until network connection)", RAIN_GAUGE_GPIO);
@@ -1790,17 +1571,6 @@ void app_main(void)
     
     /* Initialize debug LED */
     debug_led_init();
-    
-    /* Set initial LED state - will show status immediately on battery power */
-    if (led_debug_enabled) {
-        if (zigbee_network_connected) {
-            debug_led_set(true);  // Blue - already connected
-            ESP_LOGI(TAG, "💡 LED initialized: BLUE (network connected)");
-        } else {
-            debug_led_start_blink();  // Orange blink - will join network
-            ESP_LOGI(TAG, "💡 LED initialized: ORANGE BLINK (joining network)");
-        }
-    }
     
     /* Initialize OTA */
     ESP_ERROR_CHECK(esp_zb_ota_init());
