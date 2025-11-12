@@ -1113,11 +1113,9 @@ static void rain_gauge_task(void *arg)
                 ESP_LOGI(RAIN_TAG, "🌧️ Rain pulse #%u: %.2f mm total (+%.2f mm)",
                          rain_pulse_count, total_rainfall_mm, RAIN_MM_PER_PULSE);
                 
-                // Save to NVS every 10 pulses AND on every pulse if < 10 total
-                // This ensures early pulses are always saved
-                if (rain_pulse_count % 10 == 0 || rain_pulse_count <= 10) {
-                    save_rainfall_data(total_rainfall_mm, rain_pulse_count);
-                }
+                // Save to NVS on EVERY pulse to prevent data loss on unexpected reboots
+                // NVS wear is negligible: ~100k write cycles, rain events are rare
+                save_rainfall_data(total_rainfall_mm, rain_pulse_count);
                 
                 // Update Zigbee attribute (throttled to prevent overwhelming the stack with rapid pulses)
                 if (rain_gauge_enabled && zigbee_network_connected) {
