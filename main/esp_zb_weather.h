@@ -21,7 +21,7 @@
 #define ED_KEEP_ALIVE                   15000                                /* 15000 millisecond - poll parent every 15s */
 #define HA_ESP_BME280_ENDPOINT          1                                    /* esp BME280 environmental sensor endpoint */
 #define HA_ESP_RAIN_GAUGE_ENDPOINT      2                                    /* esp rain gauge sensor endpoint */
-#define HA_ESP_SLEEP_CONFIG_ENDPOINT    3                                    /* esp sleep configuration endpoint */
+/* Endpoint 3 (Sleep Configuration) removed - light sleep mode uses standard Zigbee reporting */
 #define ESP_ZB_PRIMARY_CHANNEL_MASK     ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK /* Zigbee primary channel mask use in the example */
 
 /* Debug LED configuration */

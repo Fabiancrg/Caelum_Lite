@@ -177,11 +177,7 @@ static void debug_led_blink_red(void)
 }
 
 /* Rain gauge configuration */
-#ifdef CONFIG_IDF_TARGET_ESP32H2
-#define RAIN_GAUGE_GPIO         12              // GPIO pin for rain gauge reed switch (RTC-capable on ESP32-H2)
-#else
-#define RAIN_GAUGE_GPIO         5               // GPIO pin for rain gauge reed switch (RTC-capable on ESP32-C6)
-#endif
+#define RAIN_GAUGE_GPIO         12              // GPIO pin for rain gauge reed switch
 #define RAIN_MM_PER_PULSE       0.36f           // mm of rain per bucket tip (adjust for your sensor)
 
 /* Rain gauge variables */
@@ -201,13 +197,6 @@ static float last_reported_rainfall_mm = 0.0f;  // Track last reported value for
 /* Rain reporting thresholds */
 #define REPORT_THRESHOLD_MM 1.0f  // Report every 1mm of rainfall
 
-/* Sleep configuration variables */
-static uint32_t sleep_duration_seconds = SLEEP_DURATION_S;  // Default 15 minutes (900 seconds)
-static const char *SLEEP_CONFIG_TAG = "SLEEP_CONFIG";
-#define SLEEP_CONFIG_NVS_NAMESPACE      "sleep_config"
-#define SLEEP_CONFIG_NVS_KEY            "duration_sec"
-#define SLEEP_CONFIG_ATTR_ID            0x8000  // Custom attribute ID for sleep duration
-
 /* Network connection status (zigbee_network_connected declared earlier for LED functions) */
 static uint32_t connection_retry_count = 0;
 #define NETWORK_RETRY_SLEEP_DURATION    30      // 30 seconds for network retry
@@ -219,8 +208,6 @@ static uint32_t connection_retry_count = 0;
 static void builtin_button_callback(button_action_t action);
 static void factory_reset_device(uint8_t param);
 static void bme280_read_and_report(uint8_t param);
-static esp_err_t sleep_config_load(void);
-static esp_err_t sleep_config_save(void);
 static void rain_gauge_init(void);
 static void rain_gauge_isr_handler(void *arg);
 static void rain_gauge_task(void *arg);
@@ -229,7 +216,6 @@ static void rain_gauge_enable_isr(void);
 static void rain_gauge_disable_isr(void);
 static esp_err_t battery_adc_init(void);
 static void battery_read_and_report(uint8_t param);
-static void sleep_duration_report(uint8_t param);
 static esp_err_t deferred_driver_init(void)
 {
     /* Initialize builtin button with callback for factory reset */
@@ -280,9 +266,6 @@ static esp_err_t deferred_driver_init(void)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Battery ADC initialization failed, will use simulated values");
     }
-    
-    /* Load sleep configuration */
-    sleep_config_load();
     
     return ESP_OK;
 }
@@ -395,7 +378,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             esp_zb_scheduler_alarm((esp_zb_callback_t)bme280_read_and_report, 0, 1000); // Report in 1 second
             esp_zb_scheduler_alarm((esp_zb_callback_t)rain_gauge_zigbee_update, 0, 2000); // Report rainfall in 2 seconds
             esp_zb_scheduler_alarm((esp_zb_callback_t)battery_read_and_report, 0, 3000); // Report battery in 3 seconds
-            esp_zb_scheduler_alarm((esp_zb_callback_t)sleep_duration_report, 0, 4000); // Report sleep duration in 4 seconds
             
             /* Deinitialize LED after successful join - LED kept on for 5 seconds to confirm join, then powered down */
             ESP_LOGI(TAG, "💡 LED will power down in 5 seconds to save battery");
@@ -458,37 +440,7 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
     ESP_LOGI(TAG, "Received message: endpoint(%d), cluster(0x%x), attribute(0x%x), data size(%d)", message->info.dst_endpoint, message->info.cluster,
              message->attribute.id, message->attribute.data.size);
     
-    /* Handle sleep duration configuration via analog input cluster */
-    if (message->info.dst_endpoint == HA_ESP_SLEEP_CONFIG_ENDPOINT && 
-        message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT &&
-        message->attribute.id == ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID) {
-        
-        if (message->attribute.data.size == sizeof(float)) {
-            float new_duration_float = *(float*)message->attribute.data.value;
-            uint32_t new_duration = (uint32_t)new_duration_float;
-            
-            // Validate range: 60 seconds (1 minute) to 7200 seconds (2 hours)
-            if (new_duration >= 60 && new_duration <= 7200) {
-                sleep_duration_seconds = new_duration;
-                sleep_config_save();
-                
-                /* Update the analog input present value to reflect the accepted value */
-                float accepted_value = (float)sleep_duration_seconds;
-                esp_zb_zcl_set_attribute_val(HA_ESP_SLEEP_CONFIG_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
-                                           ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
-                                           &accepted_value, false);
-                
-                ESP_LOGI(SLEEP_CONFIG_TAG, "🔧 Sleep duration updated to %d seconds (%.1f minutes) via Zigbee", 
-                         sleep_duration_seconds, sleep_duration_seconds / 60.0f);
-            } else {
-                ESP_LOGW(SLEEP_CONFIG_TAG, "Invalid sleep duration %d (must be 60-7200 seconds)", new_duration);
-                ret = ESP_ERR_INVALID_ARG;
-            }
-        } else {
-            ESP_LOGW(SLEEP_CONFIG_TAG, "Invalid data size for sleep duration: %d", message->attribute.data.size);
-            ret = ESP_ERR_INVALID_SIZE;
-        }
-    }
+    /* No custom attribute handling needed - all attributes managed by standard Zigbee reporting */
     
     return ret;
 }
@@ -790,40 +742,10 @@ static void esp_zb_task(void *pvParameters)
     };
     esp_zb_ep_list_add_ep(esp_zb_ep_list, esp_zb_rain_clusters, endpoint_rain_config);
 
-    /* CREATE SLEEP CONFIGURATION ENDPOINT */
-    esp_zb_cluster_list_t *esp_zb_sleep_clusters = esp_zb_zcl_cluster_list_create();
-    
-    /* Basic cluster intentionally omitted for sleep config endpoint (EP3).
-     * This endpoint exposes only the sleep configuration Analog Input cluster.
+    /* Endpoint 3 (Sleep Configuration) removed in light sleep mode.
+     * Device uses automatic sleep/wake with standard Zigbee reporting configuration.
+     * Reporting intervals controlled by coordinator via configureReporting commands.
      */
-    
-    /* Create Analog Input cluster for sleep duration configuration (writable) */
-    float sleep_duration_float = (float)sleep_duration_seconds;  // Convert to float for analog input
-    esp_zb_analog_input_cluster_cfg_t sleep_analog_cfg = {
-        .present_value = sleep_duration_float,
-    };
-    esp_zb_attribute_list_t *esp_zb_sleep_analog_cluster = esp_zb_analog_input_cluster_create(&sleep_analog_cfg);
-    
-    /* Add description attribute */
-    char sleep_description[] = "\x0E""Sleep Duration";  // Length-prefixed: 14 bytes + "Sleep Duration"
-    esp_zb_analog_input_cluster_add_attr(esp_zb_sleep_analog_cluster, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_DESCRIPTION_ID, sleep_description);
-    
-    /* Add engineering units attribute (seconds) */
-    uint16_t time_units = 73;  // Engineering units code for seconds
-    esp_zb_analog_input_cluster_add_attr(esp_zb_sleep_analog_cluster, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_ENGINEERING_UNITS_ID, &time_units);
-    
-    ESP_ERROR_CHECK(esp_zb_cluster_list_add_analog_input_cluster(esp_zb_sleep_clusters, esp_zb_sleep_analog_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
-    
-    /* Add Identify cluster for sleep config endpoint */
-    ESP_ERROR_CHECK(esp_zb_cluster_list_add_identify_cluster(esp_zb_sleep_clusters, esp_zb_identify_cluster_create(NULL), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
-    
-    esp_zb_endpoint_config_t endpoint_sleep_config = {
-        .endpoint = HA_ESP_SLEEP_CONFIG_ENDPOINT,
-        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-        .app_device_id = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID,
-        .app_device_version = 0
-    };
-    esp_zb_ep_list_add_ep(esp_zb_ep_list, esp_zb_sleep_clusters, endpoint_sleep_config);
 
     /* LED debug endpoint removed - On/Off control moved to primary endpoint.
      * LED functionality is handled via the genOnOff cluster on the primary
@@ -1392,83 +1314,7 @@ skip_adc:
              battery_voltage, percentage, zigbee_voltage, zigbee_percentage);
 }
 
-/* Sleep duration reporting function */
-static void sleep_duration_report(uint8_t param)
-{
-    float sleep_duration_float = (float)sleep_duration_seconds;
-    
-    esp_err_t ret = esp_zb_zcl_set_attribute_val(
-        HA_ESP_SLEEP_CONFIG_ENDPOINT,
-        ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-        ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
-        &sleep_duration_float,
-        true  // Force reporting to ensure Z2M gets the update
-    );
-    
-    if (ret == ESP_OK) {
-        ESP_LOGI(SLEEP_CONFIG_TAG, "✅ Sleep duration %.0f seconds (%.1f min) reported to Zigbee", 
-                 sleep_duration_float, sleep_duration_float / 60.0f);
-    } else {
-        ESP_LOGE(SLEEP_CONFIG_TAG, "❌ Failed to report sleep duration: %s", esp_err_to_name(ret));
-    }
-}
-
-/* Sleep configuration functions */
-static esp_err_t sleep_config_load(void)
-{
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open(SLEEP_CONFIG_NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGI(SLEEP_CONFIG_TAG, "No previous sleep configuration found, using default %d seconds", sleep_duration_seconds);
-        return ESP_OK;
-    }
-
-    size_t required_size = sizeof(uint32_t);
-    err = nvs_get_blob(nvs_handle, SLEEP_CONFIG_NVS_KEY, &sleep_duration_seconds, &required_size);
-    if (err == ESP_OK) {
-        // Validate range: 60 seconds (1 minute) to 7200 seconds (2 hours)
-        if (sleep_duration_seconds < 60) {
-            ESP_LOGW(SLEEP_CONFIG_TAG, "Sleep duration too short (%d), setting to minimum 60 seconds", sleep_duration_seconds);
-            sleep_duration_seconds = 60;
-        } else if (sleep_duration_seconds > 7200) {
-            ESP_LOGW(SLEEP_CONFIG_TAG, "Sleep duration too long (%d), setting to maximum 7200 seconds", sleep_duration_seconds);
-            sleep_duration_seconds = 7200;
-        }
-        ESP_LOGI(SLEEP_CONFIG_TAG, "📂 Loaded sleep duration: %d seconds (%.1f minutes)", 
-                 sleep_duration_seconds, sleep_duration_seconds / 60.0f);
-    } else {
-        ESP_LOGI(SLEEP_CONFIG_TAG, "No sleep configuration found, using default %d seconds", sleep_duration_seconds);
-    }
-
-    nvs_close(nvs_handle);
-    return ESP_OK;
-}
-
-static esp_err_t sleep_config_save(void)
-{
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open(SLEEP_CONFIG_NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(SLEEP_CONFIG_TAG, "Failed to open NVS for sleep config: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    err = nvs_set_blob(nvs_handle, SLEEP_CONFIG_NVS_KEY, &sleep_duration_seconds, sizeof(uint32_t));
-    if (err == ESP_OK) {
-        err = nvs_commit(nvs_handle);
-        if (err == ESP_OK) {
-            ESP_LOGI(SLEEP_CONFIG_TAG, "💾 Sleep duration saved: %d seconds (%.1f minutes)", 
-                     sleep_duration_seconds, sleep_duration_seconds / 60.0f);
-        }
-    } else {
-        ESP_LOGE(SLEEP_CONFIG_TAG, "Failed to save sleep duration: %s", esp_err_to_name(err));
-    }
-
-    nvs_close(nvs_handle);
-    return err;
-}
-
+/* Rain gauge initialization and handlers */
 static void rain_gauge_init(void)
 {
     ESP_LOGI(RAIN_TAG, "Initializing rain gauge on GPIO%d (disabled until network connection)", RAIN_GAUGE_GPIO);

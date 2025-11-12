@@ -6,14 +6,14 @@ export default {
     vendor: 'ESPRESSIF',
     description: 'Caelum - Battery-powered Zigbee weather station with rain gauge',
     extend: [
-        m.deviceEndpoints({endpoints: {"1":1,"2":2,"3":3}}),
+        m.deviceEndpoints({endpoints: {"1":1,"2":2}}),
         m.temperature(
             {
                 endpointNames: ["1"],
                 unit: "°C",
                 access: "STATE_GET",
                 precision: 1,
-                reporting: {min: 10, max: 3600, change: 0.1},
+                reporting: {min: 0, max: 600, change: 0.1},
             }
         ),
         m.humidity(),
@@ -25,17 +25,10 @@ export default {
                 access: "STATE_GET",
                 precision: 1,
                 icon: "mdi:gauge",
-                reporting: {min: 10, max: 3600, change: 0.1},
+                reporting: {min: 0, max: 600, change: 0.1},
             }
         ),
         m.battery(),
-        m.onOff(
-            {
-                powerOnBehavior: false,
-                description: "LED debug indicator control",
-                exposesName: "Debug LED"
-            }
-        ),
         m.numeric(
             {
                 endpointNames: ["2"],
@@ -43,7 +36,7 @@ export default {
                 property: "rain_amount",
                 cluster: "genAnalogInput",
                 attribute: "presentValue",
-                reporting: {"min":10,"max":3600,"change":0.1},
+                reporting: {"min":0,"max":600,"change":0.1},
                 description: "Total rainfall",
                 unit: "mm",
                 precision: 1,
@@ -52,23 +45,6 @@ export default {
                 exposesName: "Rain amount"
             }
         ),
-        m.numeric(
-            {
-                endpointNames: ["3"],
-                name: "sleep_duration",
-                property: "sleep_duration",
-                cluster: "genAnalogInput",
-                attribute: "presentValue",
-                reporting: {"min":10,"max":3600,"change":0.1},
-                description: "Sleep duration configuration",
-                unit: "s",
-                valueMin: 60,
-                valueMax: 900,
-                access: "ALL",
-                icon: "mdi:sleep",
-                exposesName: "Sleep duration"
-            }
-        )
     ],
     ota: true,
 };
