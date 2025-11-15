@@ -124,6 +124,8 @@ static void builtin_button_task(void *arg)
     TickType_t press_start_time = 0;
     bool long_press_reported = false;
     const TickType_t LONG_PRESS_DURATION = pdMS_TO_TICKS(5000); // 5 seconds for factory reset
+    const TickType_t MAX_BUTTON_TASK_DURATION = pdMS_TO_TICKS(10000); // 10 seconds max task duration
+    TickType_t task_start_time = 0;
 
     for (;;) {
         /* Wait for button interrupt */
@@ -131,11 +133,23 @@ static void builtin_button_task(void *arg)
             /* Disable interrupts during debouncing */
             gpio_intr_disable(CONFIG_EXAMPLE_BUILTIN_BUTTON_GPIO);
             evt_flag = true;
+            task_start_time = xTaskGetTickCount();  // Track when we started processing
         }
 
         while (evt_flag) {
             bool button_level = gpio_get_level(CONFIG_EXAMPLE_BUILTIN_BUTTON_GPIO);
             TickType_t current_time = xTaskGetTickCount();
+            
+            /* CRITICAL: Add timeout to prevent infinite loop if GPIO gets stuck */
+            TickType_t task_duration = current_time - task_start_time;
+            if (task_duration > MAX_BUTTON_TASK_DURATION) {
+                ESP_LOGW(BUILTIN_BUTTON_TAG, "Button task timeout after %lu ms - forcing exit", 
+                         pdTICKS_TO_MS(task_duration));
+                button_state = BUILTIN_BUTTON_IDLE;
+                evt_flag = false;
+                gpio_intr_enable(CONFIG_EXAMPLE_BUILTIN_BUTTON_GPIO);
+                break;
+            }
             
             switch (button_state) {
             case BUILTIN_BUTTON_IDLE:
