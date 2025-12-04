@@ -6,7 +6,7 @@ export default {
     vendor: 'ESPRESSIF',
     description: 'Caelum - Battery-powered Zigbee weather station with rain gauge',
     extend: [
-        m.deviceEndpoints({endpoints: {"1":1,"2":2}}),
+        m.deviceEndpoints({endpoints: {"1":1,"2":2,"3":3,"4":4}}),
         m.temperature(
             {
                 endpointNames: ["1"],
@@ -43,6 +43,28 @@ export default {
                 access: "STATE_GET",
                 icon: "mdi:weather-rainy",
                 exposesName: "Rain amount"
+            }
+        ),
+        m.numeric(
+            {
+                endpointNames: ["3"],
+                name: "pulse_count",
+                property: "pulse_count",
+                cluster: "genAnalogInput",
+                attribute: "presentValue",
+                reporting: {"min":0,"max":3600,"change":1},
+                description: "Pulse count",
+                access: "STATE_GET",
+                exposesName: "Pulse Count"
+            }
+        ),
+        m.temperature(
+            {
+                endpointNames: ["4"],
+                unit: "°C",
+                access: "STATE_GET",
+                precision: 1,
+                reporting: {min: 10, max: 3600, change: 0.1},
             }
         ),
     ],

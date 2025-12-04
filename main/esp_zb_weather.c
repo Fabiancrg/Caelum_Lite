@@ -73,6 +73,12 @@ static const char *TAG = "WEATHER_STATION";
 /* Network connection status - declared early for LED functions */
 static bool zigbee_network_connected = false;
 
+/* Sleep prevention during initial configuration
+ * Prevents device from sleeping for 60 seconds after joining network
+ * This gives coordinator (Z2M) time to configure reporting without interruption */
+static int64_t network_join_time_us = 0;
+#define INITIAL_CONFIG_DELAY_SEC 60  // Wait 60 seconds before allowing sleep after join
+
 /* LED is used only during boot/join process:
  * - Blink yellow/orange during network joining
  * - Steady blue when successfully connected
@@ -435,6 +441,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             zigbee_network_connected = true;
             connection_retry_count = 0;
             
+            /* Record join time to prevent sleep during initial configuration */
+            network_join_time_us = esp_timer_get_time();
+            ESP_LOGI(TAG, "🕐 Network join time recorded - sleep disabled for %d seconds to allow reporting configuration", INITIAL_CONFIG_DELAY_SEC);
+            
             /* Enable rain gauge now that we're connected */
             rain_gauge_enable_isr();
             ESP_LOGI(RAIN_TAG, "Rain gauge enabled - device connected to Zigbee network");
@@ -505,7 +515,25 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             ESP_LOGW(TAG, "⚠️ OTA upgrade in progress - preventing sleep");
             /* Don't call esp_zb_sleep_now() - let OTA complete */
             break;
-        }        
+        }
+        
+        /* Prevent sleep during initial configuration period after network join
+         * This allows coordinator (Z2M) to configure reporting without interruption */
+        if (network_join_time_us > 0) {
+            int64_t time_since_join_us = esp_timer_get_time() - network_join_time_us;
+            int64_t config_period_us = (int64_t)INITIAL_CONFIG_DELAY_SEC * 1000000LL;
+            
+            if (time_since_join_us < config_period_us) {
+                int remaining_sec = (int)((config_period_us - time_since_join_us) / 1000000LL);
+                ESP_LOGD(TAG, "⏳ Preventing sleep during initial config period (%d sec remaining)", remaining_sec);
+                /* Don't sleep - let coordinator configure device */
+                break;
+            } else {
+                /* Configuration period complete - allow sleep from now on */
+                ESP_LOGI(TAG, "✅ Initial configuration period complete - sleep now enabled");
+                network_join_time_us = 0;  // Clear flag so we don't check again
+            }
+        }
         
         /* LED is already deinitialized after successful join - no action needed */
         esp_zb_sleep_now();
@@ -662,6 +690,16 @@ static void esp_zb_task(void *pvParameters)
     rain_pulse_count = loaded_pulses;
     if (loaded_rainfall > 0.0f || loaded_pulses > 0) {
         ESP_LOGI(TAG, "📂 Pre-loaded rainfall for cluster init: %.2f mm (%lu pulses)", total_rainfall_mm, rain_pulse_count);
+    }
+    
+    /* Load pulse counter data from RTC/NVS BEFORE creating clusters */
+    float loaded_pulse_value = 0.0f;
+    uint32_t loaded_pulse_count = 0;
+    load_pulse_counter_data(&loaded_pulse_value, &loaded_pulse_count);
+    total_pulse_count_value = roundf(loaded_pulse_value * 100.0f) / 100.0f;
+    pulse_counter_count = loaded_pulse_count;
+    if (loaded_pulse_value > 0.0f || loaded_pulse_count > 0) {
+        ESP_LOGI(TAG, "📂 Pre-loaded pulse counter for cluster init: %.2f (%lu pulses)", total_pulse_count_value, pulse_counter_count);
     }
     
     /* Create endpoint list */
@@ -906,13 +944,18 @@ static void esp_zb_task(void *pvParameters)
     /* Create DS18B20 temperature sensor endpoint (GPIO24) */
     esp_zb_cluster_list_t *esp_zb_ds18b20_clusters = esp_zb_zcl_cluster_list_create();
     
-    /* Create Temperature Measurement cluster for DS18B20 with REPORTING flag */
-    esp_zb_temperature_meas_cluster_cfg_t ds18b20_temp_cfg = {
-        .measured_value = (int16_t)(ds18b20_last_temp * 100),  // Initialize with last known value
-        .min_value = -5000,     // -50°C
-        .max_value = 12500      // 125°C
-    };
-    esp_zb_attribute_list_t *esp_zb_ds18b20_temperature_cluster = esp_zb_temperature_meas_cluster_create(&ds18b20_temp_cfg);
+    /* Create Temperature Measurement cluster for DS18B20 with REPORTING flag
+     * Must manually create cluster to ensure REPORTING flag is set for persistence */
+    int16_t ds18b20_temp_value = (int16_t)(ds18b20_last_temp * 100);  // Initialize with last known value
+    int16_t ds18b20_temp_min = -5000;     // -50°C
+    int16_t ds18b20_temp_max = 12500;     // 125°C
+    
+    esp_zb_attribute_list_t *esp_zb_ds18b20_temperature_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT);
+    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(esp_zb_ds18b20_temperature_cluster, ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+                                            ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID, ESP_ZB_ZCL_ATTR_TYPE_S16,
+                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &ds18b20_temp_value));
+    ESP_ERROR_CHECK(esp_zb_temperature_meas_cluster_add_attr(esp_zb_ds18b20_temperature_cluster, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_MIN_VALUE_ID, &ds18b20_temp_min));
+    ESP_ERROR_CHECK(esp_zb_temperature_meas_cluster_add_attr(esp_zb_ds18b20_temperature_cluster, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_MAX_VALUE_ID, &ds18b20_temp_max));
     
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_temperature_meas_cluster(esp_zb_ds18b20_clusters, esp_zb_ds18b20_temperature_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
     
@@ -1157,16 +1200,27 @@ static void periodic_sensor_report_callback(void *arg)
 {
     if (zigbee_network_connected) {
         ESP_LOGI(TAG, "⏰ Periodic sensor read timer fired (5-minute interval)");
+        ESP_LOGI(TAG, "📊 Updating all endpoints: EP1=BME280, EP2=Rain, EP3=Pulse, EP4=DS18B20");
+        
         /* Schedule sensor reads via Zigbee scheduler to avoid ISR context issues.
          * Note: These functions update Zigbee attributes but don't force reporting.
          * The Zigbee stack will automatically send reports based on the coordinator's
          * reporting configuration (min/max intervals, reportable change thresholds). */
+        
+        /* Endpoint 1: BME280 (temperature, humidity, pressure, battery) */
         esp_zb_scheduler_alarm((esp_zb_callback_t)bme280_read_and_report, 0, 100);
-        esp_zb_scheduler_alarm((esp_zb_callback_t)ds18b20_read_and_report, 0, 150);
+        
+        /* Endpoint 4: DS18B20 temperature sensor */
+        esp_zb_scheduler_alarm((esp_zb_callback_t)ds18b20_read_and_report, 0, 200);
+        
+        /* Endpoint 2: Rain gauge */
         rain_gauge_request_flush(false, true);
+        
+        /* Endpoint 3: Pulse counter */
         pulse_counter_request_flush(false, true);
+        
         /* Battery is read hourly based on its own time tracking */
-        esp_zb_scheduler_alarm((esp_zb_callback_t)battery_read_and_report, 0, 300);
+        esp_zb_scheduler_alarm((esp_zb_callback_t)battery_read_and_report, 0, 400);
     } else {
         ESP_LOGW(TAG, "⏰ Periodic timer fired but network disconnected - skipping sensor read");
     }
@@ -1357,8 +1411,10 @@ static void rain_gauge_flush_totals(bool save_to_nvs, bool update_attribute)
     }
 
     if (update_attribute) {
-        if (!rain_gauge_enabled || !zigbee_network_connected) {
-            ESP_LOGW(RAIN_TAG, "Skipping Zigbee update - network not ready");
+        /* Only check network connection, not ISR enabled state
+         * This allows periodic updates even when ISR is temporarily disabled */
+        if (!zigbee_network_connected) {
+            ESP_LOGW(RAIN_TAG, "Skipping Zigbee update - network not connected");
             return;
         }
 
@@ -1371,9 +1427,9 @@ static void rain_gauge_flush_totals(bool save_to_nvs, bool update_attribute)
             false);
 
         if (ret == ESP_OK) {
-            ESP_LOGI(RAIN_TAG, "📡 Rain attribute updated: %.2f mm", rounded_rainfall);
+            ESP_LOGI(RAIN_TAG, "📡 Rain gauge attribute updated: %.2f mm (%u pulses)", rounded_rainfall, rain_pulse_count);
         } else {
-            ESP_LOGE(RAIN_TAG, "Failed to update rain attribute: %s", esp_err_to_name(ret));
+            ESP_LOGE(RAIN_TAG, "❌ Failed to update rain attribute: %s", esp_err_to_name(ret));
         }
     }
 }
@@ -2044,20 +2100,15 @@ static void pulse_counter_flush_totals(bool save_to_nvs, bool update_attribute)
         ESP_LOGI(PULSE_TAG, "💾 Flushing pulse totals to storage: %.2f (%u pulses)",
                  rounded_pulse_value, pulse_counter_count);
         
-        /* Save to NVS with different key names */
-        nvs_handle_t nvs_handle;
-        esp_err_t err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
-        if (err == ESP_OK) {
-            nvs_set_blob(nvs_handle, "pulse_val", &rounded_pulse_value, sizeof(float));
-            nvs_set_u32(nvs_handle, "pulse_cnt", pulse_counter_count);
-            nvs_commit(nvs_handle);
-            nvs_close(nvs_handle);
-        }
+        /* Save to RTC memory and NVS using sleep_manager (same as rain gauge) */
+        save_pulse_counter_data(rounded_pulse_value, pulse_counter_count);
     }
 
     if (update_attribute) {
-        if (!pulse_counter_enabled || !zigbee_network_connected) {
-            ESP_LOGW(PULSE_TAG, "Skipping Zigbee update - network not ready");
+        /* Only check network connection, not ISR enabled state
+         * This allows periodic updates even when ISR is temporarily disabled */
+        if (!zigbee_network_connected) {
+            ESP_LOGW(PULSE_TAG, "Skipping Zigbee update - network not connected");
             return;
         }
 
@@ -2070,9 +2121,9 @@ static void pulse_counter_flush_totals(bool save_to_nvs, bool update_attribute)
             false);
 
         if (ret == ESP_OK) {
-            ESP_LOGI(PULSE_TAG, "📡 Pulse attribute updated: %.2f", rounded_pulse_value);
+            ESP_LOGI(PULSE_TAG, "📡 Pulse counter attribute updated: %.2f (%u pulses)", rounded_pulse_value, pulse_counter_count);
         } else {
-            ESP_LOGE(PULSE_TAG, "Failed to update pulse attribute: %s", esp_err_to_name(ret));
+            ESP_LOGE(PULSE_TAG, "❌ Failed to update pulse attribute: %s", esp_err_to_name(ret));
         }
     }
 }
@@ -2129,21 +2180,8 @@ static void pulse_counter_init(void)
     /* Start disabled - will be enabled when connected to network */
     pulse_counter_enabled = false;
     
-    /* Load pulse counter data from NVS */
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open("storage", NVS_READONLY, &nvs_handle);
-    if (err == ESP_OK) {
-        size_t required_size = sizeof(float);
-        err = nvs_get_blob(nvs_handle, "pulse_val", &total_pulse_count_value, &required_size);
-        if (err != ESP_OK) {
-            total_pulse_count_value = 0.0f;
-        }
-        err = nvs_get_u32(nvs_handle, "pulse_cnt", &pulse_counter_count);
-        if (err != ESP_OK) {
-            pulse_counter_count = 0;
-        }
-        nvs_close(nvs_handle);
-    }
+    /* Load pulse counter data from RTC memory or NVS (same as rain gauge) */
+    load_pulse_counter_data(&total_pulse_count_value, &pulse_counter_count);
     
     ESP_LOGI(PULSE_TAG, "Current pulse counter total: %.2f (%lu pulses)", total_pulse_count_value, pulse_counter_count);
     
@@ -2241,11 +2279,12 @@ static void pulse_counter_init(void)
  */
 static bool ds18b20_reset(void)
 {
-    gpio_set_direction(DS18B20_GPIO, GPIO_MODE_OUTPUT);
+    /* Pull bus low for reset pulse */
     gpio_set_level(DS18B20_GPIO, 0);
     esp_rom_delay_us(480);  // Reset pulse (480-960us)
     
-    gpio_set_direction(DS18B20_GPIO, GPIO_MODE_INPUT);
+    /* Release bus and wait for presence pulse */
+    gpio_set_level(DS18B20_GPIO, 1);  // Release (open-drain + pull-up = high)
     esp_rom_delay_us(70);   // Wait for presence pulse (60-240us)
     
     int level = gpio_get_level(DS18B20_GPIO);
@@ -2259,16 +2298,16 @@ static bool ds18b20_reset(void)
  */
 static void ds18b20_write_bit(uint8_t bit)
 {
-    gpio_set_direction(DS18B20_GPIO, GPIO_MODE_OUTPUT);
+    /* Pull bus low to start time slot */
     gpio_set_level(DS18B20_GPIO, 0);
     
     if (bit) {
         esp_rom_delay_us(6);   // Write 1: short low pulse
-        gpio_set_level(DS18B20_GPIO, 1);
+        gpio_set_level(DS18B20_GPIO, 1);  // Release bus early
         esp_rom_delay_us(64);
     } else {
         esp_rom_delay_us(60);  // Write 0: long low pulse
-        gpio_set_level(DS18B20_GPIO, 1);
+        gpio_set_level(DS18B20_GPIO, 1);  // Release bus at end
         esp_rom_delay_us(10);
     }
 }
@@ -2278,11 +2317,12 @@ static void ds18b20_write_bit(uint8_t bit)
  */
 static uint8_t ds18b20_read_bit(void)
 {
-    gpio_set_direction(DS18B20_GPIO, GPIO_MODE_OUTPUT);
+    /* Pull bus low briefly to start read slot */
     gpio_set_level(DS18B20_GPIO, 0);
     esp_rom_delay_us(3);
     
-    gpio_set_direction(DS18B20_GPIO, GPIO_MODE_INPUT);
+    /* Release bus and sample */
+    gpio_set_level(DS18B20_GPIO, 1);
     esp_rom_delay_us(10);
     
     uint8_t bit = gpio_get_level(DS18B20_GPIO);
@@ -2322,27 +2362,132 @@ static uint8_t ds18b20_read_byte(void)
  * 
  * Configures GPIO24 for 1-Wire communication and verifies DS18B20 presence.
  * If sensor is not detected, logs warning and continues (allows device to work without DS18B20).
+ * Implements retry logic with increased delays to handle sensors that need more power-up time.
  */
 static void ds18b20_init(void)
 {
     ESP_LOGI(DS18B20_TAG, "Initializing DS18B20 on GPIO%d...", DS18B20_GPIO);
     
-    /* Configure GPIO as open-drain with pull-up (1-Wire requires pull-up) */
+    /* Configure GPIO as open-drain output (external 4.7kΩ pull-up resistor on PCB)
+     * Important: Internal pull-up DISABLED because hardware has external resistor */
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << DS18B20_GPIO),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .mode = GPIO_MODE_INPUT_OUTPUT_OD,  // Open-drain mode for 1-Wire
+        .pull_up_en = GPIO_PULLUP_DISABLE,   // External pull-up present (4.7kΩ to 3.3V)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&io_conf);
     
-    /* Test presence of DS18B20 */
-    vTaskDelay(pdMS_TO_TICKS(10));  // Allow bus to stabilize
+    /* Set initial state high (idle) */
+    gpio_set_level(DS18B20_GPIO, 1);
     
-    if (ds18b20_reset()) {
+    /* Test presence of DS18B20 with retry logic
+     * Some sensors need more time to power up, especially with longer cables or marginal power */
+    const int MAX_RETRIES = 5;
+    const int RETRY_DELAYS_MS[] = {0, 10, 50, 100, 200};  // First attempt immediate, then progressive backoff
+    bool detected = false;
+    
+    for (int retry = 0; retry < MAX_RETRIES; retry++) {
+        if (retry > 0) {
+            ESP_LOGI(DS18B20_TAG, "🔄 Retry %d/%d after %dms delay...", 
+                     retry + 1, MAX_RETRIES, RETRY_DELAYS_MS[retry]);
+            vTaskDelay(pdMS_TO_TICKS(RETRY_DELAYS_MS[retry]));  // Allow bus to stabilize
+        }
+        
+        if (ds18b20_reset()) {
+            detected = true;
+            if (retry > 0) {
+                ESP_LOGI(DS18B20_TAG, "✅ DS18B20 detected on GPIO%d (attempt %d/%d after %dms delay)", 
+                         DS18B20_GPIO, retry + 1, MAX_RETRIES, RETRY_DELAYS_MS[retry]);
+            } else {
+                ESP_LOGI(DS18B20_TAG, "✅ DS18B20 detected on GPIO%d (first attempt)", DS18B20_GPIO);
+            }
+            break;
+        } else {
+            if (retry < MAX_RETRIES - 1) {
+                ESP_LOGI(DS18B20_TAG, "❌ No response on attempt %d/%d, will retry...", 
+                         retry + 1, MAX_RETRIES);
+            } else {
+                ESP_LOGI(DS18B20_TAG, "❌ No response after %d attempts - giving up", MAX_RETRIES);
+            }
+        }
+    }
+    
+    if (detected) {
         ds18b20_available = true;
-        ESP_LOGI(DS18B20_TAG, "✅ DS18B20 detected on GPIO%d", DS18B20_GPIO);
+        
+        /* Perform initial temperature reading with retry logic
+         * First conversion after power-up may need more time */
+        ESP_LOGI(DS18B20_TAG, "Performing initial temperature reading...");
+        
+        const int READ_RETRIES = 3;
+        const int CONVERSION_DELAYS_MS[] = {850, 1000, 1200};  // Progressive delays for retry
+        bool reading_success = false;
+        
+        for (int read_attempt = 0; read_attempt < READ_RETRIES && !reading_success; read_attempt++) {
+            if (read_attempt > 0) {
+                ESP_LOGI(DS18B20_TAG, "🔄 Initial read retry %d/%d (longer conversion delay: %dms)", 
+                         read_attempt + 1, READ_RETRIES, CONVERSION_DELAYS_MS[read_attempt]);
+            }
+            
+            /* Start temperature conversion */
+            if (!ds18b20_reset()) {
+                ESP_LOGW(DS18B20_TAG, "❌ Reset failed before conversion (attempt %d)", read_attempt + 1);
+                vTaskDelay(pdMS_TO_TICKS(100));  // Wait before retry
+                continue;
+            }
+            
+            ds18b20_write_byte(DS18B20_CMD_SKIP_ROM);
+            ds18b20_write_byte(DS18B20_CMD_CONVERT_T);
+            vTaskDelay(pdMS_TO_TICKS(CONVERSION_DELAYS_MS[read_attempt]));  // Wait for conversion
+            
+            /* Read scratchpad */
+            if (ds18b20_reset()) {
+                ds18b20_write_byte(DS18B20_CMD_SKIP_ROM);
+                ds18b20_write_byte(DS18B20_CMD_READ_SCRATCHPAD);
+                
+                uint8_t temp_lsb = ds18b20_read_byte();
+                uint8_t temp_msb = ds18b20_read_byte();
+                
+                int16_t raw_temp = (temp_msb << 8) | temp_lsb;
+                float temperature = (float)raw_temp * 0.0625f;
+                
+                if (temperature >= -55.0f && temperature <= 125.0f) {
+                    ds18b20_last_temp = temperature;
+                    reading_success = true;
+                    
+                    if (read_attempt > 0) {
+                        ESP_LOGI(DS18B20_TAG, "✅ Initial temperature reading successful on attempt %d: %.2f°C (raw: 0x%04X)", 
+                                 read_attempt + 1, temperature, raw_temp);
+                    } else {
+                        ESP_LOGI(DS18B20_TAG, "🌡️ Initial temperature reading: %.2f°C (raw: 0x%04X)", temperature, raw_temp);
+                    }
+                    
+                    /* Update Zigbee attribute with initial value */
+                    int16_t temp_centidegrees = (int16_t)(temperature * 100);
+                    esp_err_t attr_ret = esp_zb_zcl_set_attribute_val(HA_ESP_DS18B20_ENDPOINT, 
+                                                                       ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+                                                                       ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, 
+                                                                       ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
+                                                                       &temp_centidegrees, false);
+                    if (attr_ret == ESP_OK) {
+                        ESP_LOGI(DS18B20_TAG, "✅ Initial attribute updated");
+                    } else {
+                        ESP_LOGW(DS18B20_TAG, "Failed to update initial attribute: %s", esp_err_to_name(attr_ret));
+                    }
+                } else {
+                    ESP_LOGW(DS18B20_TAG, "❌ Initial reading out of range: %.2f°C (attempt %d)", 
+                             temperature, read_attempt + 1);
+                }
+            } else {
+                ESP_LOGW(DS18B20_TAG, "❌ Reset failed after conversion (attempt %d)", read_attempt + 1);
+            }
+        }
+        
+        if (!reading_success) {
+            ESP_LOGW(DS18B20_TAG, "⚠️ Failed to read initial temperature after %d attempts - will retry on next read cycle", READ_RETRIES);
+        }
     } else {
         ds18b20_available = false;
         ESP_LOGW(DS18B20_TAG, "⚠️ No DS18B20 detected on GPIO%d - sensor disabled", DS18B20_GPIO);
@@ -2363,26 +2508,33 @@ static void ds18b20_read_and_report(uint8_t param)
     
     /* Check if DS18B20 is available */
     if (!ds18b20_available) {
-        ESP_LOGD(DS18B20_TAG, "DS18B20 not available - skipping read");
+        ESP_LOGW(DS18B20_TAG, "⚠️ DS18B20 not available - skipping read (sensor disabled at init)");
         return;
     }
+    
+    ESP_LOGI(DS18B20_TAG, "Starting DS18B20 temperature measurement...");
     
     /* Reset and check presence */
+    ESP_LOGD(DS18B20_TAG, "Sending reset pulse...");
     if (!ds18b20_reset()) {
-        ESP_LOGW(DS18B20_TAG, "DS18B20 not responding");
+        ESP_LOGW(DS18B20_TAG, "❌ DS18B20 not responding to reset");
         return;
     }
+    ESP_LOGD(DS18B20_TAG, "✓ Device present");
     
     /* Start temperature conversion */
+    ESP_LOGD(DS18B20_TAG, "Starting temperature conversion...");
     ds18b20_write_byte(DS18B20_CMD_SKIP_ROM);  // Skip ROM (single device)
     ds18b20_write_byte(DS18B20_CMD_CONVERT_T);  // Convert T command
     
     /* Wait for conversion (750ms for 12-bit resolution) */
+    ESP_LOGD(DS18B20_TAG, "Waiting 800ms for conversion...");
     vTaskDelay(pdMS_TO_TICKS(800));
     
     /* Read scratchpad */
+    ESP_LOGD(DS18B20_TAG, "Reading scratchpad...");
     if (!ds18b20_reset()) {
-        ESP_LOGW(DS18B20_TAG, "DS18B20 not responding after conversion");
+        ESP_LOGW(DS18B20_TAG, "❌ DS18B20 not responding after conversion");
         return;
     }
     
@@ -2393,13 +2545,17 @@ static void ds18b20_read_and_report(uint8_t param)
     uint8_t temp_lsb = ds18b20_read_byte();
     uint8_t temp_msb = ds18b20_read_byte();
     
+    ESP_LOGD(DS18B20_TAG, "Raw bytes: LSB=0x%02X, MSB=0x%02X", temp_lsb, temp_msb);
+    
     /* Convert to temperature (12-bit resolution: 0.0625°C per bit) */
     int16_t raw_temp = (temp_msb << 8) | temp_lsb;
     float temperature = (float)raw_temp * 0.0625f;
     
+    ESP_LOGI(DS18B20_TAG, "Raw value: %d, Temperature: %.2f°C", raw_temp, temperature);
+    
     /* Basic sanity check (-55°C to 125°C is DS18B20 range) */
     if (temperature < -55.0f || temperature > 125.0f) {
-        ESP_LOGW(DS18B20_TAG, "Invalid temperature reading: %.2f°C", temperature);
+        ESP_LOGW(DS18B20_TAG, "❌ Invalid temperature reading: %.2f°C (out of range)", temperature);
         return;
     }
     
@@ -2409,14 +2565,16 @@ static void ds18b20_read_and_report(uint8_t param)
     /* Convert to Zigbee format (0.01°C units) */
     int16_t temp_centidegrees = (int16_t)(temperature * 100);
     
+    ESP_LOGD(DS18B20_TAG, "Updating Zigbee attribute: %d (0.01°C units)", temp_centidegrees);
+    
     /* Update Zigbee attribute (false = don't force report, let coordinator config decide) */
     esp_err_t ret = esp_zb_zcl_set_attribute_val(HA_ESP_DS18B20_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
                                                   ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
                                                   &temp_centidegrees, false);
     if (ret == ESP_OK) {
-        ESP_LOGI(DS18B20_TAG, "🌡️ DS18B20 Temperature: %.2f°C (attribute updated)", temperature);
+        ESP_LOGI(DS18B20_TAG, "✅ DS18B20 Temperature: %.2f°C (attribute updated)", temperature);
     } else {
-        ESP_LOGE(DS18B20_TAG, "Failed to update temperature attribute: %s", esp_err_to_name(ret));
+        ESP_LOGE(DS18B20_TAG, "❌ Failed to update temperature attribute: %s", esp_err_to_name(ret));
     }
 }
 

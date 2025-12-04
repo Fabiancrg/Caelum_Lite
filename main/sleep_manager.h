@@ -59,6 +59,23 @@ void save_rainfall_data(float rainfall_mm, uint32_t pulse_count);
  */
 bool load_rainfall_data(float *rainfall_mm, uint32_t *pulse_count);
 
+/**
+ * @brief Save pulse counter data to RTC memory and NVS
+ * 
+ * @param pulse_value Total pulse counter value
+ * @param pulse_count Total pulse count
+ */
+void save_pulse_counter_data(float pulse_value, uint32_t pulse_count);
+
+/**
+ * @brief Load pulse counter data from RTC memory or NVS
+ * 
+ * @param pulse_value Pointer to store pulse counter value
+ * @param pulse_count Pointer to store pulse count
+ * @return true if loaded from RTC memory, false if from NVS
+ */
+bool load_pulse_counter_data(float *pulse_value, uint32_t *pulse_count);
+
 /* NOTE: Manual enter_light_sleep() removed - Zigbee stack handles sleep automatically
  * via ESP_ZB_COMMON_SIGNAL_CAN_SLEEP signal and esp_zb_sleep_now() */
 

@@ -23,6 +23,8 @@ static const char *SLEEP_TAG = "SLEEP";
 static RTC_DATA_ATTR uint32_t boot_count = 0;
 static RTC_DATA_ATTR float rtc_rainfall_mm = 0.0f;
 static RTC_DATA_ATTR uint32_t rtc_rain_pulse_count = 0;
+static RTC_DATA_ATTR float rtc_pulse_counter_value = 0.0f;
+static RTC_DATA_ATTR uint32_t rtc_pulse_counter_count = 0;
 static RTC_DATA_ATTR int64_t last_report_timestamp = 0;
 
 /* Wake-up reason tracking */
@@ -65,6 +67,8 @@ wake_reason_t check_wake_reason(void)
             if (boot_count == 1) {
                 rtc_rainfall_mm = 0.0f;
                 rtc_rain_pulse_count = 0;
+                rtc_pulse_counter_value = 0.0f;
+                rtc_pulse_counter_count = 0;
                 last_report_timestamp = 0;
             }
             return WAKE_REASON_RESET;
@@ -171,6 +175,72 @@ bool load_rainfall_data(float *rainfall_mm, uint32_t *pulse_count)
     *rainfall_mm = 0.0f;
     *pulse_count = 0;
     ESP_LOGI(SLEEP_TAG, "📂 No stored data, starting from 0.0 mm");
+    return false;
+}
+
+/**
+ * @brief Save pulse counter data to RTC memory and NVS
+ * @param pulse_value Current total pulse counter value
+ * @param pulse_count Current pulse count
+ */
+void save_pulse_counter_data(float pulse_value, uint32_t pulse_count)
+{
+    // Save to RTC memory (fast, survives sleep)
+    rtc_pulse_counter_value = pulse_value;
+    rtc_pulse_counter_count = pulse_count;
+    
+    ESP_LOGI(SLEEP_TAG, "💾 Saved to RTC: %.2f value, %lu pulses", rtc_pulse_counter_value, rtc_pulse_counter_count);
+    
+    // Also save to NVS for persistence across power loss
+    nvs_handle_t nvs_handle;
+    esp_err_t ret = nvs_open("pulse_storage", NVS_READWRITE, &nvs_handle);
+    if (ret == ESP_OK) {
+        nvs_set_blob(nvs_handle, "pulse_val", &pulse_value, sizeof(float));
+        nvs_set_u32(nvs_handle, "pulse_cnt", pulse_count);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+        ESP_LOGI(SLEEP_TAG, "💾 Saved to NVS: %.2f value, %lu pulses", pulse_value, pulse_count);
+    }
+}
+
+/**
+ * @brief Load pulse counter data from RTC memory or NVS
+ * @param pulse_value Pointer to store pulse counter value
+ * @param pulse_count Pointer to store pulse count
+ * @return true if data loaded from RTC, false if loaded from NVS
+ */
+bool load_pulse_counter_data(float *pulse_value, uint32_t *pulse_count)
+{
+    // Check if we have valid RTC data (from previous sleep cycle)
+    if (boot_count > 1 && rtc_pulse_counter_value >= 0.0f) {
+        *pulse_value = rtc_pulse_counter_value;
+        *pulse_count = rtc_pulse_counter_count;
+        ESP_LOGI(SLEEP_TAG, "📂 Loaded from RTC: %.2f value, %lu pulses", *pulse_value, *pulse_count);
+        return true;
+    }
+    
+    // Otherwise, try to load from NVS
+    nvs_handle_t nvs_handle;
+    esp_err_t ret = nvs_open("pulse_storage", NVS_READONLY, &nvs_handle);
+    if (ret == ESP_OK) {
+        size_t size = sizeof(float);
+        ret = nvs_get_blob(nvs_handle, "pulse_val", pulse_value, &size);
+        if (ret == ESP_OK) {
+            nvs_get_u32(nvs_handle, "pulse_cnt", pulse_count);
+            nvs_close(nvs_handle);
+            ESP_LOGI(SLEEP_TAG, "📂 Loaded from NVS: %.2f value, %lu pulses", *pulse_value, *pulse_count);
+            
+            // Update RTC memory
+            rtc_pulse_counter_value = *pulse_value;
+            rtc_pulse_counter_count = *pulse_count;
+            return false;
+        }
+        nvs_close(nvs_handle);
+    }
+    
+    // No stored data, start fresh
+    *pulse_value = 0.0f;
+    *pulse_count = 0;
     return false;
 }
 
