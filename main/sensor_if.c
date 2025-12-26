@@ -104,11 +104,13 @@ esp_err_t sensor_wake_and_measure(void)
     } else if (detected == SENSOR_TYPE_SHT41_BMP280) {
         esp_err_t r1 = sht41_trigger_measurement();
         esp_err_t r2 = bmp280_trigger_measurement();
+        // Return OK if at least one succeeds (allows partial functionality)
         return (r1 == ESP_OK || r2 == ESP_OK) ? ESP_OK : ESP_FAIL;
     } else if (detected == SENSOR_TYPE_AHT20_BMP280) {
         // AHT20 may require a trigger; BMP280 starts measurement on read
         esp_err_t r1 = aht20_trigger_measurement();
         esp_err_t r2 = bmp280_trigger_measurement();
+        // Return OK if at least one succeeds (allows partial functionality)
         return (r1 == ESP_OK || r2 == ESP_OK) ? ESP_OK : ESP_FAIL;
     }
     return ESP_ERR_NOT_FOUND;
@@ -158,9 +160,11 @@ esp_err_t sensor_read_pressure(float *out_hpa)
         *out_hpa = DEFAULT_PRESSURE_HPA;
         return ESP_OK;
     } else if (detected == SENSOR_TYPE_SHT41_BMP280) {
-        return bmp280_read_pressure(out_hpa);
+        // Use no-trigger version since measurement already triggered in sensor_wake_and_measure()
+        return bmp280_read_pressure_no_trigger(out_hpa);
     } else if (detected == SENSOR_TYPE_AHT20_BMP280) {
-        return bmp280_read_pressure(out_hpa);
+        // Use no-trigger version since measurement already triggered in sensor_wake_and_measure()
+        return bmp280_read_pressure_no_trigger(out_hpa);
     }
     return ESP_ERR_NOT_FOUND;
 }

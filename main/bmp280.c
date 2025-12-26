@@ -104,6 +104,22 @@ esp_err_t bmp280_trigger_measurement(void)
     return i2c_bus_write_bytes(s_dev, BMP280_REG_CTRL_MEAS, 1, &ctrl);
 }
 
+// Read raw ADC values without triggering (assumes measurement already done)
+static esp_err_t bmp280_read_raw_only(int32_t *adc_T, int32_t *adc_P)
+{
+    if (!adc_T || !adc_P) return ESP_ERR_INVALID_ARG;
+    if (s_dev == NULL) return ESP_ERR_NOT_FOUND;
+
+    uint8_t data[6];
+    esp_err_t ret = i2c_bus_read_bytes(s_dev, BMP280_REG_DATA, 6, data);
+    if (ret != ESP_OK) return ret;
+
+    *adc_P = (int32_t)((((uint32_t)data[0]) << 12) | (((uint32_t)data[1]) << 4) | ((uint32_t)data[2] >> 4));
+    *adc_T = (int32_t)((((uint32_t)data[3]) << 12) | (((uint32_t)data[4]) << 4) | ((uint32_t)data[5] >> 4));
+    return ESP_OK;
+}
+
+// Read raw ADC values with trigger and wait (for standalone use)
 static esp_err_t bmp280_read_raw(int32_t *adc_T, int32_t *adc_P)
 {
     if (!adc_T || !adc_P) return ESP_ERR_INVALID_ARG;
@@ -116,13 +132,7 @@ static esp_err_t bmp280_read_raw(int32_t *adc_T, int32_t *adc_P)
     // typical max conversion time ~10ms for osrs=1; wait 15ms
     vTaskDelay(pdMS_TO_TICKS(15));
 
-    uint8_t data[6];
-    ret = i2c_bus_read_bytes(s_dev, BMP280_REG_DATA, 6, data);
-    if (ret != ESP_OK) return ret;
-
-    *adc_P = (int32_t)((((uint32_t)data[0]) << 12) | (((uint32_t)data[1]) << 4) | ((uint32_t)data[2] >> 4));
-    *adc_T = (int32_t)((((uint32_t)data[3]) << 12) | (((uint32_t)data[4]) << 4) | ((uint32_t)data[5] >> 4));
-    return ESP_OK;
+    return bmp280_read_raw_only(adc_T, adc_P);
 }
 
 esp_err_t bmp280_read_temperature(float *out_c)
@@ -138,6 +148,38 @@ esp_err_t bmp280_read_temperature(float *out_c)
     float T = var1 + var2;
     t_fine = (int32_t)T;
     *out_c = T / 5120.0f;
+    return ESP_OK;
+}
+
+esp_err_t bmp280_read_pressure_no_trigger(float *out_hpa)
+{
+    if (!out_hpa) return ESP_ERR_INVALID_ARG;
+    int32_t adc_T = 0, adc_P = 0;
+    esp_err_t ret = bmp280_read_raw_only(&adc_T, &adc_P);
+    if (ret != ESP_OK) return ret;
+
+    // compute t_fine from adc_T
+    float var1 = (((float)adc_T) / 16384.0f - ((float)dig_T1) / 1024.0f) * ((float)dig_T2);
+    float var2 = ((((float)adc_T) / 131072.0f - ((float)dig_T1) / 8192.0f) * (((float)adc_T) / 131072.0f - ((float)dig_T1) / 8192.0f)) * ((float)dig_T3);
+    float tf = var1 + var2;
+    int32_t t_f = (int32_t)tf;
+
+    // Pressure compensation (per datasheet)
+    float p_var1 = ((float)t_f / 2.0f) - 64000.0f;
+    float p_var2 = p_var1 * p_var1 * ((float)dig_P6) / 32768.0f;
+    p_var2 = p_var2 + p_var1 * ((float)dig_P5) * 2.0f;
+    p_var2 = (p_var2 / 4.0f) + (((float)dig_P4) * 65536.0f);
+    p_var1 = (((float)dig_P3) * p_var1 * p_var1 / 524288.0f + ((float)dig_P2) * p_var1) / 524288.0f;
+    p_var1 = (1.0f + p_var1 / 32768.0f) * ((float)dig_P1);
+    if (p_var1 == 0.0f) return ESP_ERR_INVALID_STATE; // avoid division by zero
+
+    float p = 1048576.0f - (float)adc_P;
+    p = (p - (p_var2 / 4096.0f)) * 6250.0f / p_var1;
+    p_var1 = ((float)dig_P9) * p * p / 2147483648.0f;
+    p_var2 = p * ((float)dig_P8) / 32768.0f;
+    p = p + (p_var1 + p_var2 + ((float)dig_P7)) / 16.0f;
+
+    *out_hpa = p / 100.0f; // convert Pa to hPa
     return ESP_OK;
 }
 
