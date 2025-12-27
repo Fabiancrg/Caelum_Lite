@@ -219,6 +219,14 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG, "❌ esp_ota_write failed: %s", esp_err_to_name(ret));
                 ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
+                /* CRITICAL: Release PM lock on write error */
+                if (ota_pm_lock != NULL) {
+                    esp_pm_lock_release(ota_pm_lock);
+                    ESP_LOGW(TAG, "🔓 PM lock released after write error");
+                }
+                esp_zb_sleep_enable(true);
+                esp_zb_set_rx_on_when_idle(false);
+                ota_transfer_active = false;
                 return ret;
             }
             
@@ -239,6 +247,14 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(ret));
                 ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
+                /* CRITICAL: Release PM lock on error */
+                if (ota_pm_lock != NULL) {
+                    esp_pm_lock_release(ota_pm_lock);
+                    ESP_LOGW(TAG, "🔓 PM lock released after esp_ota_end error");
+                }
+                esp_zb_sleep_enable(true);
+                esp_zb_set_rx_on_when_idle(false);
+                ota_transfer_active = false;
                 return ret;
             }
 
@@ -249,6 +265,14 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG, "Failed to get new app description: %s", esp_err_to_name(ret));
                 ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
+                /* CRITICAL: Release PM lock on error */
+                if (ota_pm_lock != NULL) {
+                    esp_pm_lock_release(ota_pm_lock);
+                    ESP_LOGW(TAG, "🔓 PM lock released after partition description error");
+                }
+                esp_zb_sleep_enable(true);
+                esp_zb_set_rx_on_when_idle(false);
+                ota_transfer_active = false;
                 return ret;
             }
             
@@ -260,6 +284,14 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(ret));
                 ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
+                /* CRITICAL: Release PM lock on error */
+                if (ota_pm_lock != NULL) {
+                    esp_pm_lock_release(ota_pm_lock);
+                    ESP_LOGW(TAG, "🔓 PM lock released after set_boot_partition error");
+                }
+                esp_zb_sleep_enable(true);
+                esp_zb_set_rx_on_when_idle(false);
+                ota_transfer_active = false;
                 return ret;
             }
 

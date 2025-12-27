@@ -475,11 +475,14 @@ static void configure_analog_input_reporting(uint8_t param)
     rain_report_cmd.record_number = 1;
     rain_report_cmd.record_field = &rain_record;
     
-    esp_zb_lock_acquire(portMAX_DELAY);
-    esp_zb_zcl_config_report_cmd_req(&rain_report_cmd);
-    esp_zb_lock_release();
-    
-    ESP_LOGI(RAIN_TAG, "📋 Rain gauge reporting configured: change=%.1f mm, max_interval=3600s", rain_reportable_change);
+    // Use 5-second timeout to prevent deadlock
+    if (esp_zb_lock_acquire(pdMS_TO_TICKS(5000)) == ESP_OK) {
+        esp_zb_zcl_config_report_cmd_req(&rain_report_cmd);
+        esp_zb_lock_release();
+        ESP_LOGI(RAIN_TAG, "📋 Rain gauge reporting configured: change=%.1f mm, max_interval=3600s", rain_reportable_change);
+    } else {
+        ESP_LOGW(RAIN_TAG, "Failed to acquire Zigbee lock for rain gauge reporting config (timeout)");
+    }
     
     /* Configure reporting for EP3 (pulse counter) */
     esp_zb_zcl_config_report_cmd_t pulse_report_cmd = {0};
@@ -500,11 +503,14 @@ static void configure_analog_input_reporting(uint8_t param)
     pulse_report_cmd.record_number = 1;
     pulse_report_cmd.record_field = &pulse_record;
     
-    esp_zb_lock_acquire(portMAX_DELAY);
-    esp_zb_zcl_config_report_cmd_req(&pulse_report_cmd);
-    esp_zb_lock_release();
-    
-    ESP_LOGI(PULSE_TAG, "📋 Pulse counter reporting configured: change=%.1f, max_interval=3600s", pulse_reportable_change);
+    // Use 5-second timeout to prevent deadlock
+    if (esp_zb_lock_acquire(pdMS_TO_TICKS(5000)) == ESP_OK) {
+        esp_zb_zcl_config_report_cmd_req(&pulse_report_cmd);
+        esp_zb_lock_release();
+        ESP_LOGI(PULSE_TAG, "📋 Pulse counter reporting configured: change=%.1f, max_interval=3600s", pulse_reportable_change);
+    } else {
+        ESP_LOGW(PULSE_TAG, "Failed to acquire Zigbee lock for pulse counter reporting config (timeout)");
+    }
 }
 
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
@@ -1493,7 +1499,8 @@ static void rain_gauge_task(void *arg)
     ESP_LOGI(RAIN_TAG, "Rain gauge task started, waiting for events...");
 
     for (;;) {
-        if (xQueueReceive(rain_gauge_evt_queue, &evt, portMAX_DELAY)) {
+        // Use 10 second timeout instead of portMAX_DELAY to allow watchdog and health checks
+        if (xQueueReceive(rain_gauge_evt_queue, &evt, pdMS_TO_TICKS(10000))) {
             switch (evt.type) {
             case RAIN_EVENT_PULSE: {
                 TickType_t current_time = evt.tick;
@@ -2185,7 +2192,8 @@ static void pulse_counter_task(void *arg)
     ESP_LOGI(PULSE_TAG, "Pulse counter task started, waiting for events...");
 
     for (;;) {
-        if (xQueueReceive(pulse_counter_evt_queue, &evt, portMAX_DELAY)) {
+        // Use 10 second timeout instead of portMAX_DELAY to allow watchdog and health checks
+        if (xQueueReceive(pulse_counter_evt_queue, &evt, pdMS_TO_TICKS(10000))) {
             switch (evt.type) {
             case PULSE_EVENT_PULSE: {
                 TickType_t current_time = evt.tick;
