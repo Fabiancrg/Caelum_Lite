@@ -1301,10 +1301,13 @@ static void bme280_read_and_report(uint8_t param)
      * 2. bmp280_trigger_measurement() only triggers (no delay)
      * 3. We need to wait before calling bmp280_read_pressure_no_trigger()
      * The SHT41 already waited 10ms, so we add an additional 10ms here to ensure
-     * BMP280 conversion is complete (total ~20ms, more than enough for both sensors) */
+     * BMP280 conversion is complete (total ~20ms, more than enough for both sensors)
+     * 
+     * CRITICAL: Use busy-wait instead of vTaskDelay() because this function runs
+     * in Zigbee scheduler context. vTaskDelay() can cause deadlocks! */
     sensor_type_t sensor_type = sensor_get_type();
     if (sensor_type == SENSOR_TYPE_SHT41_BMP280 || sensor_type == SENSOR_TYPE_AHT20_BMP280) {
-        vTaskDelay(pdMS_TO_TICKS(10)); // Extra delay for BMP280 pressure conversion
+        esp_rom_delay_us(10000); // 10ms busy-wait for BMP280 pressure conversion
     }
 
     /* Read temperature */

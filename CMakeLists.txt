@@ -11,7 +11,7 @@ project(caelum)
 
 # Version configuration
 set(PROJECT_VER "1.9")
-set(BUILD_NUMBER 40)
+set(BUILD_NUMBER 50)
 set(MANUFACTURER_CODE "0xFABC")
 set(IMAGE_TYPE "0x1200")
 set(ZIGBEE_STACK_VERSION "0x0003")  # Zigbee 3.0
