@@ -21,6 +21,7 @@
 #include "esp_zb_weather.h"
 #include "esp_zb_ota.h"
 #include "sleep_manager.h"
+#include "persistent_log.h"
 #include "driver/gpio.h"
 #include "bme280_app.h"
 #include "sensor_if.h"
@@ -251,6 +252,10 @@ static bool ds18b20_available = false;
 #define RAIN_FLUSH_INTERVAL_US       (10ULL * 1000ULL * 1000ULL) // 10 seconds
 static esp_timer_handle_t periodic_report_timer = NULL;
 
+/* Heartbeat logging for debugging - logs every 30 minutes to prove device is alive */
+#define HEARTBEAT_INTERVAL_MS (30 * 60 * 1000ULL)  // 30 minutes
+static esp_timer_handle_t heartbeat_timer = NULL;
+
 /* Sensor reading task - runs in separate task to avoid blocking Zigbee scheduler */
 static QueueHandle_t sensor_read_queue = NULL;
 static TaskHandle_t sensor_read_task_handle = NULL;
@@ -268,6 +273,7 @@ static void factory_reset_device(uint8_t param);
 static void bme280_read_and_report(uint8_t param);
 static void sensor_read_task(void *arg);
 static void periodic_sensor_report_callback(void *arg);
+static void heartbeat_callback(void *arg);
 static void start_periodic_reading(void);
 static void stop_periodic_reading(void);
 static void rain_gauge_init(void);
@@ -531,6 +537,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         break;
     case ESP_ZB_ZDO_SIGNAL_LEAVE:
         ESP_LOGI(TAG, "Device is leaving the Zigbee network");
+        persistent_log_add('W', TAG, "Network LEAVE signal - disconnecting");
         debug_led_stop_blink();
         /* LED is already deinitialized after initial join, no action needed */
         zigbee_network_connected = false;
@@ -582,6 +589,11 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             zigbee_network_connected = true;
             connection_retry_count = 0;
             
+            char join_msg[96];
+            snprintf(join_msg, sizeof(join_msg), "Network joined - PAN:0x%04hx Ch:%d Addr:0x%04hx",
+                     esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
+            persistent_log_add('I', TAG, join_msg);
+            
             /* Record join time to prevent sleep during initial configuration */
             network_join_time_us = esp_timer_get_time();
             ESP_LOGI(TAG, "🕐 Network join time recorded - sleep disabled for %d seconds to allow reporting configuration", INITIAL_CONFIG_DELAY_SEC);
@@ -628,6 +640,11 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             zigbee_network_connected = false;
             connection_retry_count++;
             
+            char fail_msg[96];
+            snprintf(fail_msg, sizeof(fail_msg), "Network join failed - retry %lu/%d - err:%s",
+                     (unsigned long)connection_retry_count, MAX_CONNECTION_RETRIES, esp_err_to_name(err_status));
+            persistent_log_add('W', TAG, fail_msg);
+            
             /* Disable rain gauge when not connected */
             rain_gauge_disable_isr();
             ESP_LOGW(RAIN_TAG, "Rain gauge disabled - not connected to network");
@@ -658,6 +675,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         /* Check if OTA upgrade is in progress - MUST NOT sleep during OTA! */
         if (esp_zb_ota_is_active()) {
             ESP_LOGW(TAG, "⚠️ OTA upgrade in progress - preventing sleep");
+            persistent_log_add('W', TAG, "OTA active - sleep prevented");
             /* Don't call esp_zb_sleep_now() - let OTA complete */
             break;
         }
@@ -676,11 +694,19 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             } else {
                 /* Configuration period complete - allow sleep from now on */
                 ESP_LOGI(TAG, "✅ Initial configuration period complete - sleep now enabled");
+                persistent_log_add('I', TAG, "Initial config complete - sleep enabled");
                 network_join_time_us = 0;  // Clear flag so we don't check again
             }
         }
         
         /* LED is already deinitialized after successful join - no action needed */
+        
+        static uint32_t sleep_count = 0;
+        sleep_count++;
+        char sleep_msg[96];
+        snprintf(sleep_msg, sizeof(sleep_msg), "Sleep #%lu", (unsigned long)sleep_count);
+        persistent_log_add('I', TAG, sleep_msg);
+        
         esp_zb_sleep_now();
         break;
     default:
@@ -1292,6 +1318,7 @@ static void sensor_read_task(void *arg)
 {
     uint8_t trigger;
     ESP_LOGI(TAG, "📡 Sensor read task started");
+    persistent_log_add('I', TAG, "Sensor read task started");
     
     for (;;) {
         // Wait for trigger from periodic timer
@@ -1310,6 +1337,7 @@ static void sensor_read_task(void *arg)
             battery_read_and_report(0);
             
             ESP_LOGI(TAG, "✅ Sensor read task complete");
+            persistent_log_add('I', TAG, "Sensor read cycle completed");
         }
     }
 }
@@ -1325,6 +1353,9 @@ static void bme280_read_and_report(uint8_t param)
     ret = sensor_wake_and_measure();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "sensor_wake_and_measure() returned %s - will try to read cached/last values", esp_err_to_name(ret));
+        char err_msg[96];
+        snprintf(err_msg, sizeof(err_msg), "sensor_wake_and_measure failed: %s", esp_err_to_name(ret));
+        persistent_log_add('W', TAG, err_msg);
     }
 
     /* Wait for BMP280 pressure conversion to complete (~10-15ms for osrs=1)
@@ -1351,6 +1382,14 @@ static void bme280_read_and_report(uint8_t param)
                                            &temp_centidegrees, force_report);
         if (ret == ESP_OK) {
             ESP_LOGI(TAG, "🌡️ Temperature: %.2f°C (attribute updated)", temperature);
+            
+            static float last_logged_temp = -999.0f;
+            if (fabsf(temperature - last_logged_temp) > 0.5f) {  // Log if changed by >0.5°C
+                char temp_msg[96];
+                snprintf(temp_msg, sizeof(temp_msg), "Temp: %.2fC", temperature);
+                persistent_log_add('I', TAG, temp_msg);
+                last_logged_temp = temperature;
+            }
         } else {
             ESP_LOGE(TAG, "Failed to update temperature attribute: %s", esp_err_to_name(ret));
         }
@@ -1367,6 +1406,14 @@ static void bme280_read_and_report(uint8_t param)
                                            &hum_centipercent, force_report);
         if (ret == ESP_OK) {
             ESP_LOGI(TAG, "💧 Humidity: %.2f%% (attribute updated)", humidity);
+            
+            static float last_logged_hum = -999.0f;
+            if (fabsf(humidity - last_logged_hum) > 2.0f) {  // Log if changed by >2%
+                char hum_msg[96];
+                snprintf(hum_msg, sizeof(hum_msg), "Humidity: %.2f%%", humidity);
+                persistent_log_add('I', TAG, hum_msg);
+                last_logged_hum = humidity;
+            }
         } else {
             ESP_LOGE(TAG, "Failed to update humidity attribute: %s", esp_err_to_name(ret));
         }
@@ -1407,6 +1454,12 @@ static void bme280_read_and_report(uint8_t param)
      * additional event-driven reporting based on value changes.
      */
     ESP_LOGI(TAG, "📊 Sensor data reported. Device will enter light sleep until next event.");
+    
+    static uint32_t report_count = 0;
+    report_count++;
+    char report_msg[96];
+    snprintf(report_msg, sizeof(report_msg), "Sensor report #%lu complete", (unsigned long)report_count);
+    persistent_log_add('I', TAG, report_msg);
 }
 
 /* Periodic sensor reading timer callback */
@@ -1423,6 +1476,7 @@ static void periodic_sensor_report_callback(void *arg)
     if (zigbee_network_connected) {
         ESP_LOGI(TAG, "⏰ Periodic sensor read timer fired (5-minute interval)");
         ESP_LOGI(TAG, "📊 Updating all endpoints: EP1=BME280, EP2=Rain, EP3=Pulse, EP4=DS18B20");
+        persistent_log_add('I', TAG, "Periodic timer fired - triggering sensor read");
         
         /* CRITICAL: Trigger sensor reading task instead of using Zigbee scheduler.
          * Sensor I2C operations contain vTaskDelay() which CANNOT be called from
@@ -1434,6 +1488,21 @@ static void periodic_sensor_report_callback(void *arg)
     } else {
         ESP_LOGW(TAG, "⏰ Periodic timer fired but network disconnected - skipping sensor read");
     }
+}
+
+/* Heartbeat callback - logs periodically to prove device is alive */
+static void heartbeat_callback(void *arg)
+{
+    static uint32_t heartbeat_count = 0;
+    heartbeat_count++;
+    
+    int64_t uptime_sec = esp_timer_get_time() / 1000000;
+    char hb_msg[96];
+    snprintf(hb_msg, sizeof(hb_msg), "Heartbeat #%lu - uptime: %lld sec (%.1f hrs)",
+             (unsigned long)heartbeat_count, (long long)uptime_sec, uptime_sec / 3600.0f);
+    persistent_log_add('I', TAG, hb_msg);
+    
+    ESP_LOGI(TAG, "💓 %s", hb_msg);
 }
 
 /* Start periodic sensor reading timer */
@@ -1468,6 +1537,23 @@ static void start_periodic_reading(void)
     ESP_LOGI(TAG, "⏰ Periodic sensor reading started: every 5 minutes (%llu ms)", 
              PERIODIC_READING_INTERVAL_MS);
     ESP_LOGI(TAG, "📡 Reporting to coordinator controlled by Zigbee reporting configuration");
+    
+    /* Start heartbeat timer for debugging */
+    if (heartbeat_timer == NULL) {
+        const esp_timer_create_args_t heartbeat_timer_args = {
+            .callback = &heartbeat_callback,
+            .name = "heartbeat"
+        };
+        
+        ret = esp_timer_create(&heartbeat_timer_args, &heartbeat_timer);
+        if (ret == ESP_OK) {
+            ret = esp_timer_start_periodic(heartbeat_timer, HEARTBEAT_INTERVAL_MS * 1000ULL);
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG, "💓 Heartbeat timer started (interval: %d minutes)", 
+                         (int)(HEARTBEAT_INTERVAL_MS / 60000));
+            }
+        }
+    }
 }
 
 /* Stop periodic sensor reading timer */
@@ -1478,6 +1564,13 @@ static void stop_periodic_reading(void)
         esp_timer_delete(periodic_report_timer);
         periodic_report_timer = NULL;
         ESP_LOGI(TAG, "⏰ Periodic sensor reading timer stopped");
+    }
+    
+    if (heartbeat_timer != NULL) {
+        esp_timer_stop(heartbeat_timer);
+        esp_timer_delete(heartbeat_timer);
+        heartbeat_timer = NULL;
+        ESP_LOGI(TAG, "💓 Heartbeat timer stopped");
     }
 }
 
@@ -1537,6 +1630,11 @@ static void rain_gauge_task(void *arg)
 
                     ESP_LOGI(RAIN_TAG, "🌧️ Rain pulse #%u: %.2f mm total (+%.2f mm)",
                              rain_pulse_count, total_rainfall_mm, RAIN_MM_PER_PULSE);
+                    
+                    char rain_msg[96];
+                    snprintf(rain_msg, sizeof(rain_msg), "Rain pulse #%lu: %.2fmm total",
+                             (unsigned long)rain_pulse_count, total_rainfall_mm);
+                    persistent_log_add('I', RAIN_TAG, rain_msg);
 
                     pending_nvs_flush = true;
                     if (rain_gauge_enabled && zigbee_network_connected) {
@@ -2105,6 +2203,16 @@ void app_main(void)
     /* Initialize NVS */
     ESP_ERROR_CHECK(nvs_flash_init());
     
+    /* Initialize persistent log system */
+    esp_err_t plog_ret = persistent_log_init();
+    if (plog_ret == ESP_OK) {
+        // Dump logs from previous session (if any)
+        persistent_log_dump_and_clear();
+    }
+    
+    /* Log boot event */
+    persistent_log_add('I', TAG, "Device boot - starting initialization");
+    
     /* Initialize debug LED */
     debug_led_init();
     
@@ -2239,6 +2347,11 @@ static void pulse_counter_task(void *arg)
 
                     ESP_LOGI(PULSE_TAG, "⚡ Pulse #%u: %.2f total (+%.2f)",
                              pulse_counter_count, total_pulse_count_value, PULSE_COUNTER_VALUE);
+                    
+                    char pulse_msg[96];
+                    snprintf(pulse_msg, sizeof(pulse_msg), "Pulse #%lu: %.2f total",
+                             (unsigned long)pulse_counter_count, total_pulse_count_value);
+                    persistent_log_add('I', PULSE_TAG, pulse_msg);
 
                     pending_nvs_flush = true;
                     if (pulse_counter_enabled && zigbee_network_connected) {
