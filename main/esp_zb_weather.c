@@ -263,7 +263,7 @@ static TaskHandle_t sensor_read_task_handle = NULL;
 /* Network connection status (zigbee_network_connected declared earlier for LED functions) */
 static uint32_t connection_retry_count = 0;
 #define NETWORK_RETRY_SLEEP_DURATION    30      // 30 seconds for network retry
-#define MAX_CONNECTION_RETRIES          20      // Max retries before giving up (10 minutes total)
+#define MAX_CONNECTION_RETRIES          20      // Max fast retries before switching to backoff
 
 /* Button action tracking (no state needed for action-based buttons) */
 
@@ -536,12 +536,20 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_INITIALIZATION);
         break;
     case ESP_ZB_ZDO_SIGNAL_LEAVE:
-        ESP_LOGI(TAG, "Device is leaving the Zigbee network");
+        ESP_LOGW(TAG, "Device left the Zigbee network - will attempt to rejoin");
         persistent_log_add('W', TAG, "Network LEAVE signal - disconnecting");
         debug_led_stop_blink();
-        /* LED is already deinitialized after initial join, no action needed */
         zigbee_network_connected = false;
         rain_gauge_disable_isr();
+        pulse_counter_disable_isr();
+        stop_periodic_reading();
+
+        /* Reset fast retry counter and backoff, then schedule rejoin */
+        connection_retry_count = 0;
+        backoff_attempt = 0;
+        ESP_LOGI(TAG, "Scheduling network rejoin in 5 seconds");
+        esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
+                               ESP_ZB_BDB_MODE_NETWORK_STEERING, 5000);
         break;
     case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
     case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
@@ -585,9 +593,10 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             debug_led_stop_blink();       // Stop blinking
             debug_led_set_blue();         // Set steady blue to indicate success
             
-            /* Mark network as connected and reset retry count */
+            /* Mark network as connected and reset retry / backoff state */
             zigbee_network_connected = true;
             connection_retry_count = 0;
+            backoff_attempt = 0;
             
             char join_msg[96];
             snprintf(join_msg, sizeof(join_msg), "Network joined - PAN:0x%04hx Ch:%d Addr:0x%04hx",
@@ -656,18 +665,25 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             /* Stop periodic sensor reading timer when disconnected */
             stop_periodic_reading();
             
-            /* Check if max retries reached */
+            /* Check if max fast retries reached → switch to exponential backoff */
             if (connection_retry_count >= MAX_CONNECTION_RETRIES) {
-                ESP_LOGE(TAG, "❌ Max connection retries (%d) reached - giving up", MAX_CONNECTION_RETRIES);
+                uint32_t delay_ms = get_backoff_delay_ms();
+                ESP_LOGW(TAG, "⏳ Fast retries exhausted (%d) - backoff retry #%lu in %lu seconds",
+                         MAX_CONNECTION_RETRIES, (unsigned long)backoff_attempt,
+                         (unsigned long)(delay_ms / 1000));
                 debug_led_stop_blink();
-                debug_led_blink_red();  // Blink red to indicate failure
-                /* LED will be deinitialized after red blink sequence completes */
-                esp_zb_scheduler_alarm((esp_zb_callback_t)debug_led_deinit, 0, 5000);
-                /* Device will continue to operate but won't retry network join */
+                debug_led_blink_red();  // Brief red blink to signal backoff mode
+                esp_zb_scheduler_alarm(debug_led_deinit_cb, 0, 5000);
+
+                /* Reset fast counter so next round gets another MAX_CONNECTION_RETRIES attempts */
+                connection_retry_count = 0;
+                esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
+                                       ESP_ZB_BDB_MODE_NETWORK_STEERING, delay_ms);
                 break;
             }
-            
-            ESP_LOGW(TAG, "🔄 Connection attempt %d/%d failed - retrying", connection_retry_count, MAX_CONNECTION_RETRIES);
+
+            ESP_LOGW(TAG, "🔄 Connection attempt %lu/%d failed - retrying in 1s",
+                     (unsigned long)connection_retry_count, MAX_CONNECTION_RETRIES);
             esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
         }
         break;
