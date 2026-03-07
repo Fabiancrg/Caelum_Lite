@@ -111,12 +111,13 @@ esp_err_t sensor_wake_and_measure(void)
     } else if (detected == SENSOR_TYPE_SHT41_BMP280) {
         esp_err_t r1 = sht41_trigger_measurement();
         esp_err_t r2 = bmp280_trigger_measurement();
+        if (r2 != ESP_OK) ESP_LOGW(TAG, "BMP280 trigger failed (%s) - pressure will be stale", esp_err_to_name(r2));
         // Return OK if at least one succeeds (allows partial functionality)
         return (r1 == ESP_OK || r2 == ESP_OK) ? ESP_OK : ESP_FAIL;
     } else if (detected == SENSOR_TYPE_AHT20_BMP280) {
-        // AHT20 may require a trigger; BMP280 starts measurement on read
         esp_err_t r1 = aht20_trigger_measurement();
         esp_err_t r2 = bmp280_trigger_measurement();
+        if (r2 != ESP_OK) ESP_LOGW(TAG, "BMP280 trigger failed (%s) - pressure will be stale", esp_err_to_name(r2));
         // Return OK if at least one succeeds (allows partial functionality)
         return (r1 == ESP_OK || r2 == ESP_OK) ? ESP_OK : ESP_FAIL;
     }

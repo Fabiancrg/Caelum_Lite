@@ -20,7 +20,7 @@
 static const char *TAG = "PLOG";
 static const char *NVS_NAMESPACE = "plog";
 
-#define MAX_LOG_ENTRIES 1000
+#define MAX_LOG_ENTRIES 50
 #define MAX_MESSAGE_LEN 96  // Keep message concise to fit more entries
 
 typedef struct {
@@ -137,6 +137,10 @@ void persistent_log_dump_and_clear(void)
     }
 
     ESP_LOGI(TAG, "📋 ============================================================");
+
+    // Clear after dumping
+    nvs_set_u32(nvs_plog_handle, "count", 0);
+    nvs_commit(nvs_plog_handle);
 }
 
 uint32_t persistent_log_get_count(void)

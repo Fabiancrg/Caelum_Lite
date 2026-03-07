@@ -145,7 +145,7 @@ void save_rainfall_data(float rainfall_mm, uint32_t pulse_count)
 bool load_rainfall_data(float *rainfall_mm, uint32_t *pulse_count)
 {
     // Check if we have valid RTC data (from previous sleep cycle)
-    if (boot_count > 1 && rtc_rainfall_mm >= 0.0f) {
+    if (boot_count > 1) {
         *rainfall_mm = rtc_rainfall_mm;
         *pulse_count = rtc_rain_pulse_count;
         ESP_LOGI(SLEEP_TAG, "📂 Loaded from RTC: %.2f mm, %lu pulses", *rainfall_mm, *pulse_count);
@@ -212,7 +212,7 @@ void save_pulse_counter_data(float pulse_value, uint32_t pulse_count)
 bool load_pulse_counter_data(float *pulse_value, uint32_t *pulse_count)
 {
     // Check if we have valid RTC data (from previous sleep cycle)
-    if (boot_count > 1 && rtc_pulse_counter_value >= 0.0f) {
+    if (boot_count > 1) {
         *pulse_value = rtc_pulse_counter_value;
         *pulse_count = rtc_pulse_counter_count;
         ESP_LOGI(SLEEP_TAG, "📂 Loaded from RTC: %.2f value, %lu pulses", *pulse_value, *pulse_count);

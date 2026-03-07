@@ -663,7 +663,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             
             /* Deinitialize LED after successful join - LED kept on briefly to confirm join */
             ESP_LOGI(TAG, "💡 LED will power down in 5 seconds to save battery");
-            esp_zb_scheduler_alarm((esp_zb_callback_t)debug_led_deinit, 0, 5000); // Power down LED
+            esp_zb_scheduler_alarm(debug_led_deinit_cb, 0, 5000); // Power down LED
             
             /* Device will enter light sleep automatically when all initial reports complete */
             ESP_LOGI(TAG, "💤 Initial reports scheduled - device will sleep when idle");
@@ -2274,11 +2274,6 @@ void app_main(void)
     /* Check wake-up reason and print statistics */
     wake_reason_t wake_reason = check_wake_reason();
     print_wake_statistics();
-    
-    /* Load rainfall data from RTC/NVS */
-    float rainfall_mm = 0.0f;
-    uint32_t pulse_count = 0;
-    load_rainfall_data(&rainfall_mm, &pulse_count);
     
     /* Print battery life estimate (assuming 2500mAh battery) */
     estimate_battery_life(2500);
