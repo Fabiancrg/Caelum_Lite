@@ -126,6 +126,13 @@ static void debug_led_deinit(void)
     }
 }
 
+/* Properly-typed wrapper for esp_zb_scheduler_alarm (avoids UB from void(void)->void(uint8_t) cast) */
+static void debug_led_deinit_cb(uint8_t param)
+{
+    (void)param;
+    debug_led_deinit();
+}
+
 static void debug_led_set_blue(void)
 {
     /* Set steady blue for successful connection */
@@ -264,6 +271,24 @@ static TaskHandle_t sensor_read_task_handle = NULL;
 static uint32_t connection_retry_count = 0;
 #define NETWORK_RETRY_SLEEP_DURATION    30      // 30 seconds for network retry
 #define MAX_CONNECTION_RETRIES          20      // Max fast retries before switching to backoff
+
+/* Exponential backoff for reconnection after max fast retries exhausted */
+static uint32_t backoff_attempt = 0;
+#define BACKOFF_INITIAL_MS              (30  * 1000)    // 30 seconds
+#define BACKOFF_MAX_MS                  (600 * 1000)    // 10 minutes cap
+
+static uint32_t get_backoff_delay_ms(void)
+{
+    /* Exponential backoff: 30s, 60s, 120s, 240s, 480s, capped at 600s */
+    uint32_t delay = BACKOFF_INITIAL_MS << backoff_attempt;  // 30s * 2^attempt
+    if (delay > BACKOFF_MAX_MS || delay < BACKOFF_INITIAL_MS) {  // overflow guard
+        delay = BACKOFF_MAX_MS;
+    }
+    if (backoff_attempt < 10) {  // prevent shift overflow
+        backoff_attempt++;
+    }
+    return delay;
+}
 
 /* Button action tracking (no state needed for action-based buttons) */
 
