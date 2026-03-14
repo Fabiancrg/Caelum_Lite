@@ -701,12 +701,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         }
         break;
     case ESP_ZB_COMMON_SIGNAL_CAN_SLEEP:
-        /* Check if OTA upgrade is in progress - MUST NOT sleep during OTA! */
-        if (esp_zb_ota_is_active()) {
-            ESP_LOGD(TAG, "OTA upgrade in progress - preventing sleep");
-            /* Don't call esp_zb_sleep_now() - let OTA complete */
-            break;
-        }
+        /* During OTA: let esp_zb_sleep_now() run normally. The PM lock
+         * prevents actual light sleep, so the stack "wakes up" immediately
+         * and polls the parent for the next OTA chunk — fast polling. */
         
         /* Prevent sleep during initial configuration period after network join
          * This allows coordinator (Z2M) to configure reporting without interruption */

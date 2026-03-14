@@ -114,31 +114,25 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             total_received = 0;
             total_image_size = message.ota_header.image_size;
 
-            /* CRITICAL: For Sleepy End Devices, prevent ALL sleep modes:
-             * 1. Disable Zigbee sleep so device stays awake
-             * 2. Set RX always-on so radio is listening
-             * 3. Acquire PM lock to prevent ESP32 light sleep (keeps UART active!)
-             */
-            ESP_LOGW(TAG, "🚫 Disabling Zigbee sleep for OTA transfer");
-            esp_zb_sleep_enable(false);
-            
-            ESP_LOGW(TAG, "📡 Setting RX always-on for OTA transfer");
-            esp_zb_set_rx_on_when_idle(true);
-            
-            /* Acquire Power Management lock to prevent light sleep
-             * This is CRITICAL for keeping UART console active during OTA */
+            /* OTA on a Sleepy End Device (ZED):
+             * Do NOT call esp_zb_sleep_enable(false) or esp_zb_set_rx_on_when_idle(true).
+             * Both break the Zigbee stack's internal poll cycle. A ZED receives data
+             * via indirect transmission: the coordinator buffers frames and the device
+             * polls to pick them up. Polling is driven by the sleep→wake cycle.
+             *
+             * Instead, we acquire a PM lock (ESP_PM_NO_LIGHT_SLEEP) which prevents
+             * the CPU from entering light sleep. When the Zigbee stack calls
+             * esp_zb_sleep_now(), the sleep is a no-op and the stack "wakes up"
+             * immediately, polls the parent, and gets data — effectively fast polling.
+             * This keeps UART active for logging while maintaining the poll cycle. */
             if (ota_pm_lock != NULL) {
                 ret = esp_pm_lock_acquire(ota_pm_lock);
                 if (ret == ESP_OK) {
-                    ESP_LOGI(TAG, "🔒 PM lock acquired - light sleep disabled, UART will stay active");
+                    ESP_LOGI(TAG, "🔒 PM lock acquired - light sleep blocked, fast polling active");
                 } else {
-                    ESP_LOGW(TAG, "⚠️ Failed to acquire PM lock: %s", esp_err_to_name(ret));
+                    ESP_LOGW(TAG, "Failed to acquire PM lock: %s", esp_err_to_name(ret));
                 }
             }
-            
-            ESP_LOGI(TAG, "✅ OTA sleep prevention configured - device fully awake");
-            ESP_LOGI(TAG, "⚡ Device is now in always-on mode for OTA reception");
-            ESP_LOGI(TAG, "📺 Console logging will remain active during OTA transfer");
 
             // Begin OTA update.
             // OTA_WITH_SEQUENTIAL_WRITES erases flash lazily (one sector at a time as
@@ -248,8 +242,8 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
                     esp_pm_lock_release(ota_pm_lock);
                     ESP_LOGW(TAG, "🔓 PM lock released after write error");
                 }
-                esp_zb_sleep_enable(true);
-                esp_zb_set_rx_on_when_idle(false);
+
+
                 ota_transfer_active = false;
                 return ret;
             }
@@ -276,8 +270,8 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
                     esp_pm_lock_release(ota_pm_lock);
                     ESP_LOGW(TAG, "🔓 PM lock released after esp_ota_end error");
                 }
-                esp_zb_sleep_enable(true);
-                esp_zb_set_rx_on_when_idle(false);
+
+
                 ota_transfer_active = false;
                 return ret;
             }
@@ -294,8 +288,8 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
                     esp_pm_lock_release(ota_pm_lock);
                     ESP_LOGW(TAG, "🔓 PM lock released after partition description error");
                 }
-                esp_zb_sleep_enable(true);
-                esp_zb_set_rx_on_when_idle(false);
+
+
                 ota_transfer_active = false;
                 return ret;
             }
@@ -313,8 +307,8 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
                     esp_pm_lock_release(ota_pm_lock);
                     ESP_LOGW(TAG, "🔓 PM lock released after set_boot_partition error");
                 }
-                esp_zb_sleep_enable(true);
-                esp_zb_set_rx_on_when_idle(false);
+
+
                 ota_transfer_active = false;
                 return ret;
             }
@@ -326,10 +320,7 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             
             /* Re-enable sleep before reboot (will be re-configured after reboot) */
             ota_transfer_active = false;
-            ESP_LOGI(TAG, "✅ Re-enabling Zigbee sleep before reboot");
-            esp_zb_sleep_enable(true);
-            esp_zb_set_rx_on_when_idle(false);
-            
+
             /* Release PM lock to allow normal power management */
             if (ota_pm_lock != NULL) {
                 esp_pm_lock_release(ota_pm_lock);
@@ -361,16 +352,15 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_FINISH;
             break;
 
+        case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ABORT:
+            ESP_LOGW(TAG, "OTA upgrade aborted by coordinator");
+            /* Fall through to ERROR cleanup */
+
         case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR:
-            ESP_LOGE(TAG, "✗ OTA upgrade error");
+            ESP_LOGE(TAG, "✗ OTA upgrade %s", message.upgrade_status == ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ABORT ? "aborted" : "error");
             ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
             ota_transfer_active = false;
 
-            /* Re-enable sleep after OTA failure */
-            ESP_LOGW(TAG, "✅ Re-enabling Zigbee sleep after OTA failure");
-            esp_zb_sleep_enable(true);
-            esp_zb_set_rx_on_when_idle(false);
-            
             /* Release PM lock to allow normal power management */
             if (ota_pm_lock != NULL) {
                 esp_pm_lock_release(ota_pm_lock);
