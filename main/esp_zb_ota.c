@@ -33,6 +33,7 @@ static esp_pm_lock_handle_t ota_pm_lock = NULL;
 static const esp_partition_t *update_partition = NULL;
 static esp_ota_handle_t update_handle = 0;
 static uint32_t total_received = 0;
+static uint32_t total_image_size = 0;
 
 /**
  * @brief Initialize OTA functionality
@@ -111,6 +112,7 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_START;
             ota_transfer_active = true;
             total_received = 0;
+            total_image_size = message.ota_header.total_image_size;
 
             /* CRITICAL: For Sleepy End Devices, prevent ALL sleep modes:
              * 1. Disable Zigbee sleep so device stays awake
@@ -202,9 +204,9 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
                 
                 total_received += message.payload_size;
                 
-                ESP_LOGI(TAG, "✅ Chunk written in %lld us. Total: %ld bytes (%.1f%%)", 
-                         write_time_us, total_received, 
-                         (float)total_received / 668222.0f * 100.0f);  // Hardcoded expected size for now
+                ESP_LOGI(TAG, "✅ Chunk written in %lld us. Total: %ld bytes (%.1f%%)",
+                         write_time_us, total_received,
+                         total_image_size > 0 ? (float)total_received / (float)total_image_size * 100.0f : 0.0f);
                 
                 /* CRITICAL: Yield to prevent blocking Zigbee stack
                  * The OTA callback runs in Zigbee context. If we block too long,
@@ -326,7 +328,9 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             break;
 
         case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_CHECK:
-            ESP_LOGI(TAG, "OTA upgrade check");
+            ESP_LOGI(TAG, "OTA upgrade check - manufacturer: 0x%04X, image_type: 0x%04X, file_version: 0x%08lX, size: %ld",
+                     message.ota_header.manufacturer_code, message.ota_header.image_type,
+                     (unsigned long)message.ota_header.file_version, (long)message.ota_header.total_image_size);
             ret = ESP_OK;
             break;
 
