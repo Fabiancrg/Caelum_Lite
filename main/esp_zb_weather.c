@@ -295,6 +295,7 @@ static uint32_t get_backoff_delay_ms(void)
 static void builtin_button_callback(button_action_t action);
 static void factory_reset_device(uint8_t param);
 static void bme280_read_and_report(uint8_t param);
+static void initial_sensor_read_trigger(uint8_t param);
 static void sensor_read_task(void *arg);
 static void periodic_sensor_report_callback(void *arg);
 static void heartbeat_callback(void *arg);
@@ -642,7 +643,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
              * Update attributes (but don't force reports) so coordinator can read current values.
              * Actual reports will be sent based on local and coordinator's reporting configuration. */
             ESP_LOGI(TAG, "📊 Scheduling initial sensor data updates after network join");
-            esp_zb_scheduler_alarm((esp_zb_callback_t)bme280_read_and_report, 0, 2000); // Update in 2 seconds
+            esp_zb_scheduler_alarm((esp_zb_callback_t)initial_sensor_read_trigger, 0, 2000); // Trigger via queue in 2 seconds
             // Queue rain gauge flush to publish current total after network join
             rain_gauge_request_flush(false, true);
             // Queue pulse counter flush to publish current total after network join
@@ -1327,6 +1328,17 @@ static void factory_reset_device(uint8_t param)
     /* Restart the device after a short delay */
     vTaskDelay(pdMS_TO_TICKS(1000));
     esp_restart();
+}
+
+/* Scheduler alarm callback for initial post-join sensor read.
+ * Sends to sensor_read_queue instead of reading directly, because
+ * sensor drivers use vTaskDelay() which must not run in Zigbee scheduler context. */
+static void initial_sensor_read_trigger(uint8_t param)
+{
+    uint8_t trigger = 1;
+    if (sensor_read_queue != NULL) {
+        xQueueSend(sensor_read_queue, &trigger, 0);
+    }
 }
 
 /* Sensor reading task - runs in dedicated FreeRTOS task context

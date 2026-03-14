@@ -16,6 +16,7 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_zb_weather.h"
+#include <math.h>
 
 static const char *SLEEP_TAG = "SLEEP";
 
@@ -148,6 +149,11 @@ bool load_rainfall_data(float *rainfall_mm, uint32_t *pulse_count)
     if (boot_count > 1) {
         *rainfall_mm = rtc_rainfall_mm;
         *pulse_count = rtc_rain_pulse_count;
+        if (!isfinite(*rainfall_mm)) {
+            ESP_LOGW(SLEEP_TAG, "RTC rainfall NaN/Inf — resetting to 0");
+            *rainfall_mm = 0.0f;
+            *pulse_count = 0;
+        }
         ESP_LOGI(SLEEP_TAG, "📂 Loaded from RTC: %.2f mm, %lu pulses", *rainfall_mm, *pulse_count);
         return true;
     }
@@ -215,6 +221,11 @@ bool load_pulse_counter_data(float *pulse_value, uint32_t *pulse_count)
     if (boot_count > 1) {
         *pulse_value = rtc_pulse_counter_value;
         *pulse_count = rtc_pulse_counter_count;
+        if (!isfinite(*pulse_value)) {
+            ESP_LOGW(SLEEP_TAG, "RTC pulse counter NaN/Inf — resetting to 0");
+            *pulse_value = 0.0f;
+            *pulse_count = 0;
+        }
         ESP_LOGI(SLEEP_TAG, "📂 Loaded from RTC: %.2f value, %lu pulses", *pulse_value, *pulse_count);
         return true;
     }
