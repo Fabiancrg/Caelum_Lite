@@ -21,7 +21,6 @@
 #include "esp_zb_weather.h"
 #include "esp_zb_ota.h"
 #include "sleep_manager.h"
-#include "persistent_log.h"
 #include "driver/gpio.h"
 #include "bme280_app.h"
 #include "sensor_if.h"
@@ -334,8 +333,8 @@ static esp_err_t deferred_driver_init(void)
         .mode = I2C_MODE_MASTER,
         .sda_io_num = GPIO_NUM_10,     // ESP32-H2 I2C SDA
         .scl_io_num = GPIO_NUM_11,     // ESP32-H2 I2C SCL
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .sda_pullup_en = GPIO_PULLUP_DISABLE,  // Use external pull-ups only (saves ~140µA)
+        .scl_pullup_en = GPIO_PULLUP_DISABLE,
         .master.clk_speed = 100000,    // 100 KHz
     };
     
@@ -388,14 +387,14 @@ static esp_err_t esp_zb_power_save_init(void)
     int cur_cpu_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
     esp_pm_config_t pm_config = {
         .max_freq_mhz = cur_cpu_freq_mhz,
-        .min_freq_mhz = cur_cpu_freq_mhz,
+        .min_freq_mhz = CONFIG_XTAL_FREQ,  // Scale down to XTAL (32 MHz) when idle
 #if CONFIG_FREERTOS_USE_TICKLESS_IDLE
         .light_sleep_enable = true
 #endif
     };
     rc = esp_pm_configure(&pm_config);
     ESP_LOGI(TAG, "Power management configured: max=%dMHz, min=%dMHz, light_sleep=%s",
-             cur_cpu_freq_mhz, cur_cpu_freq_mhz, 
+             cur_cpu_freq_mhz, CONFIG_XTAL_FREQ,
 #if CONFIG_FREERTOS_USE_TICKLESS_IDLE
              "enabled"
 #else
@@ -562,7 +561,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         break;
     case ESP_ZB_ZDO_SIGNAL_LEAVE:
         ESP_LOGW(TAG, "Device left the Zigbee network - will attempt to rejoin");
-        persistent_log_add('W', TAG, "Network LEAVE signal - disconnecting");
         debug_led_stop_blink();
         zigbee_network_connected = false;
         rain_gauge_disable_isr();
@@ -623,11 +621,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             connection_retry_count = 0;
             backoff_attempt = 0;
             
-            char join_msg[96];
-            snprintf(join_msg, sizeof(join_msg), "Network joined - PAN:0x%04hx Ch:%d Addr:0x%04hx",
-                     esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
-            persistent_log_add('I', TAG, join_msg);
-            
             /* Record join time to prevent sleep during initial configuration */
             network_join_time_us = esp_timer_get_time();
             ESP_LOGI(TAG, "🕐 Network join time recorded - sleep disabled for %d seconds to allow reporting configuration", INITIAL_CONFIG_DELAY_SEC);
@@ -674,11 +667,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             zigbee_network_connected = false;
             connection_retry_count++;
             
-            char fail_msg[96];
-            snprintf(fail_msg, sizeof(fail_msg), "Network join failed - retry %lu/%d - err:%s",
-                     (unsigned long)connection_retry_count, MAX_CONNECTION_RETRIES, esp_err_to_name(err_status));
-            persistent_log_add('W', TAG, fail_msg);
-            
             /* Disable rain gauge when not connected */
             rain_gauge_disable_isr();
             ESP_LOGW(RAIN_TAG, "Rain gauge disabled - not connected to network");
@@ -716,7 +704,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         /* Check if OTA upgrade is in progress - MUST NOT sleep during OTA! */
         if (esp_zb_ota_is_active()) {
             ESP_LOGW(TAG, "⚠️ OTA upgrade in progress - preventing sleep");
-            persistent_log_add('W', TAG, "OTA active - sleep prevented");
             /* Don't call esp_zb_sleep_now() - let OTA complete */
             break;
         }
@@ -735,19 +722,12 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             } else {
                 /* Configuration period complete - allow sleep from now on */
                 ESP_LOGI(TAG, "✅ Initial configuration period complete - sleep now enabled");
-                persistent_log_add('I', TAG, "Initial config complete - sleep enabled");
                 network_join_time_us = 0;  // Clear flag so we don't check again
             }
         }
         
         /* LED is already deinitialized after successful join - no action needed */
-        
-        static uint32_t sleep_count = 0;
-        sleep_count++;
-        char sleep_msg[96];
-        snprintf(sleep_msg, sizeof(sleep_msg), "Sleep #%lu", (unsigned long)sleep_count);
-        persistent_log_add('I', TAG, sleep_msg);
-        
+
         esp_zb_sleep_now();
         break;
     default:
@@ -1359,7 +1339,6 @@ static void sensor_read_task(void *arg)
 {
     uint8_t trigger;
     ESP_LOGI(TAG, "📡 Sensor read task started");
-    persistent_log_add('I', TAG, "Sensor read task started");
     
     for (;;) {
         // Wait for trigger from periodic timer
@@ -1378,7 +1357,6 @@ static void sensor_read_task(void *arg)
             battery_read_and_report(0);
             
             ESP_LOGI(TAG, "✅ Sensor read task complete");
-            persistent_log_add('I', TAG, "Sensor read cycle completed");
         }
     }
 }
@@ -1394,9 +1372,6 @@ static void bme280_read_and_report(uint8_t param)
     ret = sensor_wake_and_measure();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "sensor_wake_and_measure() returned %s - will try to read cached/last values", esp_err_to_name(ret));
-        char err_msg[96];
-        snprintf(err_msg, sizeof(err_msg), "sensor_wake_and_measure failed: %s", esp_err_to_name(ret));
-        persistent_log_add('W', TAG, err_msg);
     }
 
     /* Wait for BMP280 pressure conversion to complete (~10-15ms for osrs=1)
@@ -1425,10 +1400,7 @@ static void bme280_read_and_report(uint8_t param)
             ESP_LOGI(TAG, "🌡️ Temperature: %.2f°C (attribute updated)", temperature);
             
             static float last_logged_temp = -999.0f;
-            if (fabsf(temperature - last_logged_temp) > 0.5f) {  // Log if changed by >0.5°C
-                char temp_msg[96];
-                snprintf(temp_msg, sizeof(temp_msg), "Temp: %.2fC", temperature);
-                persistent_log_add('I', TAG, temp_msg);
+            if (fabsf(temperature - last_logged_temp) > 0.5f) {
                 last_logged_temp = temperature;
             }
         } else {
@@ -1449,10 +1421,7 @@ static void bme280_read_and_report(uint8_t param)
             ESP_LOGI(TAG, "💧 Humidity: %.2f%% (attribute updated)", humidity);
             
             static float last_logged_hum = -999.0f;
-            if (fabsf(humidity - last_logged_hum) > 2.0f) {  // Log if changed by >2%
-                char hum_msg[96];
-                snprintf(hum_msg, sizeof(hum_msg), "Humidity: %.2f%%", humidity);
-                persistent_log_add('I', TAG, hum_msg);
+            if (fabsf(humidity - last_logged_hum) > 2.0f) {
                 last_logged_hum = humidity;
             }
         } else {
@@ -1498,9 +1467,6 @@ static void bme280_read_and_report(uint8_t param)
     
     static uint32_t report_count = 0;
     report_count++;
-    char report_msg[96];
-    snprintf(report_msg, sizeof(report_msg), "Sensor report #%lu complete", (unsigned long)report_count);
-    persistent_log_add('I', TAG, report_msg);
 }
 
 /* Periodic sensor reading timer callback */
@@ -1517,7 +1483,6 @@ static void periodic_sensor_report_callback(void *arg)
     if (zigbee_network_connected) {
         ESP_LOGI(TAG, "⏰ Periodic sensor read timer fired (5-minute interval)");
         ESP_LOGI(TAG, "📊 Updating all endpoints: EP1=BME280, EP2=Rain, EP3=Pulse, EP4=DS18B20");
-        persistent_log_add('I', TAG, "Periodic timer fired - triggering sensor read");
         
         /* CRITICAL: Trigger sensor reading task instead of using Zigbee scheduler.
          * Sensor I2C operations contain vTaskDelay() which CANNOT be called from
@@ -1541,7 +1506,6 @@ static void heartbeat_callback(void *arg)
     char hb_msg[96];
     snprintf(hb_msg, sizeof(hb_msg), "Heartbeat #%lu - uptime: %lld sec (%.1f hrs)",
              (unsigned long)heartbeat_count, (long long)uptime_sec, uptime_sec / 3600.0f);
-    persistent_log_add('I', TAG, hb_msg);
     
     ESP_LOGI(TAG, "💓 %s", hb_msg);
 }
@@ -1672,11 +1636,6 @@ static void rain_gauge_task(void *arg)
                     ESP_LOGI(RAIN_TAG, "🌧️ Rain pulse #%u: %.2f mm total (+%.2f mm)",
                              rain_pulse_count, total_rainfall_mm, RAIN_MM_PER_PULSE);
                     
-                    char rain_msg[96];
-                    snprintf(rain_msg, sizeof(rain_msg), "Rain pulse #%lu: %.2fmm total",
-                             (unsigned long)rain_pulse_count, total_rainfall_mm);
-                    persistent_log_add('I', RAIN_TAG, rain_msg);
-
                     pending_nvs_flush = true;
                     if (rain_gauge_enabled && zigbee_network_connected) {
                         pending_attr_flush = true;
@@ -2024,6 +1983,10 @@ static void battery_read_and_report(uint8_t param)
         nvs_close(nvs_handle);
     }
     float battery_voltage = 0.0f;
+    /* Re-init ADC if it was released after previous read */
+    if (adc_handle == NULL) {
+        battery_adc_init();
+    }
     if (adc_handle == NULL) {
         ESP_LOGE(BATTERY_TAG, "ADC not initialized, using simulated value");
         battery_voltage = 3.7f;  // Fallback simulated value
@@ -2112,8 +2075,22 @@ skip_adc:
     if (ret != ESP_OK) {
         ESP_LOGE(BATTERY_TAG, "❌ Failed to update battery percentage: %s", esp_err_to_name(ret));
     }
-    ESP_LOGI(BATTERY_TAG, "🔋 Li-Ion Battery: %.2fV (%.0f%%) (attributes updated)", 
+    ESP_LOGI(BATTERY_TAG, "🔋 Li-Ion Battery: %.2fV (%.0f%%) (attributes updated)",
              battery_voltage, percentage);
+
+    /* Power optimization: release ADC peripheral so it can power down during sleep */
+    if (adc_handle != NULL) {
+        adc_oneshot_del_unit(adc_handle);
+        adc_handle = NULL;
+    }
+    if (adc_cali_handle != NULL) {
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+        adc_cali_delete_scheme_curve_fitting(adc_cali_handle);
+#elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+        adc_cali_delete_scheme_line_fitting(adc_cali_handle);
+#endif
+        adc_cali_handle = NULL;
+    }
 }
 
 /* Rain gauge initialization and handlers */
@@ -2243,16 +2220,6 @@ void app_main(void)
 {
     /* Initialize NVS */
     ESP_ERROR_CHECK(nvs_flash_init());
-    
-    /* Initialize persistent log system */
-    esp_err_t plog_ret = persistent_log_init();
-    if (plog_ret == ESP_OK) {
-        // Dump logs from previous session (if any)
-        persistent_log_dump_and_clear();
-    }
-    
-    /* Log boot event */
-    persistent_log_add('I', TAG, "Device boot - starting initialization");
     
     /* Initialize debug LED */
     debug_led_init();
@@ -2384,11 +2351,6 @@ static void pulse_counter_task(void *arg)
                     ESP_LOGI(PULSE_TAG, "⚡ Pulse #%u: %.2f total (+%.2f)",
                              pulse_counter_count, total_pulse_count_value, PULSE_COUNTER_VALUE);
                     
-                    char pulse_msg[96];
-                    snprintf(pulse_msg, sizeof(pulse_msg), "Pulse #%lu: %.2f total",
-                             (unsigned long)pulse_counter_count, total_pulse_count_value);
-                    persistent_log_add('I', PULSE_TAG, pulse_msg);
-
                     pending_nvs_flush = true;
                     if (pulse_counter_enabled && zigbee_network_connected) {
                         pending_attr_flush = true;
