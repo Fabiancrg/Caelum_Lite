@@ -162,17 +162,31 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
                                         message.payload_size > 128 ? 128 : message.payload_size, 
                                         ESP_LOG_DEBUG);
                 
-                // Search for the ESP32 magic byte (0xE9) after the Zigbee OTA header.
-                // The OTA file layout is: [Zigbee header (header_length bytes)] +
-                // [subelement header (6 bytes)] + [ESP32 binary starting with 0xE9].
-                // Searching from offset 0 is wrong because 0xE9 can appear inside the
-                // Zigbee header (e.g. as part of the total image size field).
+                // Locate the ESP32 binary within the Zigbee OTA file.
+                // The OTA file layout is deterministic:
+                //   [56-byte Zigbee OTA base header] +
+                //   [6-byte subelement header: 2-byte tag + 4-byte length] +
+                //   [ESP32 binary starting with magic byte 0xE9]
+                // Searching for 0xE9 from offset 0 is wrong because the byte value 0xE9
+                // can appear inside the header (e.g. as part of the total image size field).
+                // The Zigbee OTA spec defines the base header as exactly 56 bytes (ZCL
+                // Table 11-2), so the binary always starts at offset 62.
+                #define ZIGBEE_OTA_HEADER_SIZE     56
+                #define ZIGBEE_OTA_SUBELEMENT_HDR   6
+                #define ZIGBEE_OTA_DATA_OFFSET     (ZIGBEE_OTA_HEADER_SIZE + ZIGBEE_OTA_SUBELEMENT_HDR)
                 int magic_offset = -1;
-                for (int i = message.ota_header.header_length; i < message.payload_size && i < 256; i++) {
-                    if (message.payload[i] == 0xE9) {
-                        magic_offset = i;
-                        ESP_LOGI(TAG, "✅ Found ESP32 magic byte (0xE9) at offset %d (after %d-byte Zigbee OTA header)", magic_offset, message.ota_header.header_length);
-                        break;
+                if (message.payload_size > ZIGBEE_OTA_DATA_OFFSET &&
+                    message.payload[ZIGBEE_OTA_DATA_OFFSET] == 0xE9) {
+                    magic_offset = ZIGBEE_OTA_DATA_OFFSET;
+                    ESP_LOGI(TAG, "✅ Found ESP32 magic byte (0xE9) at expected offset %d", magic_offset);
+                } else {
+                    // Fallback: search after the header in case of non-standard layout
+                    for (int i = ZIGBEE_OTA_HEADER_SIZE; i < message.payload_size && i < 256; i++) {
+                        if (message.payload[i] == 0xE9) {
+                            magic_offset = i;
+                            ESP_LOGW(TAG, "⚠️ Found ESP32 magic byte (0xE9) at non-standard offset %d", magic_offset);
+                            break;
+                        }
                     }
                 }
                 
