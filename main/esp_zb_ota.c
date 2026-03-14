@@ -162,12 +162,16 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
                                         message.payload_size > 128 ? 128 : message.payload_size, 
                                         ESP_LOG_DEBUG);
                 
-                // Search for the ESP32 magic byte (0xE9) in the first chunk
+                // Search for the ESP32 magic byte (0xE9) after the Zigbee OTA header.
+                // The OTA file layout is: [Zigbee header (header_length bytes)] +
+                // [subelement header (6 bytes)] + [ESP32 binary starting with 0xE9].
+                // Searching from offset 0 is wrong because 0xE9 can appear inside the
+                // Zigbee header (e.g. as part of the total image size field).
                 int magic_offset = -1;
-                for (int i = 0; i < message.payload_size && i < 256; i++) {
+                for (int i = message.ota_header.header_length; i < message.payload_size && i < 256; i++) {
                     if (message.payload[i] == 0xE9) {
                         magic_offset = i;
-                        ESP_LOGI(TAG, "✅ Found ESP32 magic byte (0xE9) at offset %d", magic_offset);
+                        ESP_LOGI(TAG, "✅ Found ESP32 magic byte (0xE9) at offset %d (after %d-byte Zigbee OTA header)", magic_offset, message.ota_header.header_length);
                         break;
                     }
                 }
