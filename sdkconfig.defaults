@@ -32,6 +32,12 @@ CONFIG_ZB_ZED=y
 
 
 #
+# OTA
+#
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# end of OTA
+
+#
 # light sleep configuration
 #
 CONFIG_PM_ENABLE=y

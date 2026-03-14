@@ -703,7 +703,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     case ESP_ZB_COMMON_SIGNAL_CAN_SLEEP:
         /* Check if OTA upgrade is in progress - MUST NOT sleep during OTA! */
         if (esp_zb_ota_is_active()) {
-            ESP_LOGW(TAG, "⚠️ OTA upgrade in progress - preventing sleep");
+            ESP_LOGD(TAG, "OTA upgrade in progress - preventing sleep");
             /* Don't call esp_zb_sleep_now() - let OTA complete */
             break;
         }

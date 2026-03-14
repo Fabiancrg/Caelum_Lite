@@ -140,8 +140,12 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             ESP_LOGI(TAG, "⚡ Device is now in always-on mode for OTA reception");
             ESP_LOGI(TAG, "📺 Console logging will remain active during OTA transfer");
 
-            // Begin OTA update
-            ret = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
+            // Begin OTA update.
+            // OTA_WITH_SEQUENTIAL_WRITES erases flash lazily (one sector at a time as
+            // data arrives) instead of erasing the entire partition upfront like
+            // OTA_SIZE_UNKNOWN does. This avoids blocking the Zigbee task for 10-20s
+            // which would cause the coordinator to time out before sending any chunks.
+            ret = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle);
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG, "❌ esp_ota_begin failed: %s", esp_err_to_name(ret));
                 ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
@@ -151,7 +155,7 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
                 }
                 return ret;
             }
-            ESP_LOGI(TAG, "✅ OTA write session started - ready to receive chunks");
+            ESP_LOGI(TAG, "✅ OTA write session started - ready to receive chunks (lazy erase enabled)");
             break;
 
         case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_RECEIVE:
