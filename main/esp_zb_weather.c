@@ -289,6 +289,21 @@ static uint32_t get_backoff_delay_ms(void)
     return delay;
 }
 
+/* Ensure shared GPIO ISR service exists before adding any handler.
+ * This avoids boot-time failures when a deferred init path partially fails.
+ */
+static bool ensure_gpio_isr_service_installed(const char *subsystem_tag, const char *subsystem_name)
+{
+    esp_err_t isr_ret = gpio_install_isr_service(ESP_INTR_FLAG_DEFAULT);
+    if (isr_ret == ESP_OK || isr_ret == ESP_ERR_INVALID_STATE) {
+        return true;
+    }
+
+    ESP_LOGE(subsystem_tag, "Failed to install GPIO ISR service for %s: %s",
+             subsystem_name, esp_err_to_name(isr_ret));
+    return false;
+}
+
 /* Button action tracking (no state needed for action-based buttons) */
 
 /********************* Define functions **************************/
@@ -577,8 +592,11 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         break;
     case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
     case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
-        /* Always initialize drivers regardless of Zigbee stack status */
-        ESP_LOGI(TAG, "Deferred driver initialization %s", deferred_driver_init() ? "failed" : "successful");
+        /* Always initialize drivers regardless of Zigbee stack status.
+         * Do not call init inside ESP_LOG* arguments because those macros
+         * compile out at low log levels (e.g. LOG_NONE). */
+        esp_err_t deferred_init_ret = deferred_driver_init();
+        ESP_LOGI(TAG, "Deferred driver initialization %s", deferred_init_ret != ESP_OK ? "failed" : "successful");
         
         if (err_status == ESP_OK) {
             ESP_LOGI(TAG, "Device started up in %s factory-reset mode", esp_zb_bdb_is_factory_new() ? "" : "non");
@@ -1755,6 +1773,15 @@ static void rain_gauge_flush_totals(bool save_to_nvs, bool update_attribute)
 static void rain_gauge_enable_isr(void)
 {
     ESP_LOGI(RAIN_TAG, "🔧 Enabling rain gauge ISR on GPIO%d (installed: %s)", RAIN_GAUGE_GPIO, rain_gauge_isr_installed ? "YES" : "NO");
+
+    if (rain_gauge_evt_queue == NULL) {
+        ESP_LOGE(RAIN_TAG, "Cannot enable rain gauge ISR: event queue not initialized");
+        return;
+    }
+
+    if (!ensure_gpio_isr_service_installed(RAIN_TAG, "rain gauge")) {
+        return;
+    }
     
     // Set enabled flag first
     rain_gauge_enabled = true;
@@ -2472,6 +2499,15 @@ static void pulse_counter_flush_totals(bool save_to_nvs, bool update_attribute)
 static void pulse_counter_enable_isr(void)
 {
     ESP_LOGI(PULSE_TAG, "🔧 Enabling pulse counter ISR on GPIO%d (installed: %s)", PULSE_COUNTER_GPIO, pulse_counter_isr_installed ? "YES" : "NO");
+
+    if (pulse_counter_evt_queue == NULL) {
+        ESP_LOGE(PULSE_TAG, "Cannot enable pulse counter ISR: event queue not initialized");
+        return;
+    }
+
+    if (!ensure_gpio_isr_service_installed(PULSE_TAG, "pulse counter")) {
+        return;
+    }
     
     // Set enabled flag first
     pulse_counter_enabled = true;
