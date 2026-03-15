@@ -1072,10 +1072,9 @@ static void esp_zb_task(void *pvParameters)
     };
     esp_zb_attribute_list_t *esp_zb_ota_client_cluster = esp_zb_ota_cluster_create(&ota_cluster_cfg);
     
-    /* Add OTA cluster attributes for Zigbee2MQTT OTA version display */
-    uint32_t current_file_version = ota_cluster_cfg.ota_upgrade_file_version;
-    // Note: Attribute 0x0002 (currentZigbeeStackVersion) is managed by the Zigbee stack - don't add manually!
-    esp_zb_ota_cluster_add_attr(esp_zb_ota_client_cluster, 0x0003, &current_file_version); // currentFileVersion
+    /* esp_zb_ota_cluster_create() already populates ESP_ZB_ZCL_ATTR_OTA_UPGRADE_FILE_VERSION_ID (0x0002)
+     * from ota_upgrade_file_version, so no manual attribute add is needed.
+     * Note: 0x0003 is StackVersion (uint16_t), NOT FileVersion — do not use it for file version. */
     
     /* Add client-specific OTA attributes */
     esp_zb_zcl_ota_upgrade_client_variable_t client_vars = {

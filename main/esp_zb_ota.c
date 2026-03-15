@@ -152,110 +152,70 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             ESP_LOGI(TAG, "✅ OTA write session started - ready to receive chunks (lazy erase enabled)");
             break;
 
-        case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_RECEIVE:
-            // Handle the first chunk specially to detect and skip OTA header
+        case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_RECEIVE: {
+            /* The Zigbee stack already parses the 56-byte OTA file header into
+             * message.ota_header.  The payload starts at the sub-element section.
+             * On the first chunk we must strip the 6-byte sub-element header
+             * (2-byte tag ID + 4-byte length) to reach the actual ESP32 image. */
+            #define OTA_SUBELEMENT_HDR_LEN  6
+
+            const uint8_t *write_ptr = message.payload;
+            uint16_t       write_len = message.payload_size;
+
             if (total_received == 0) {
-                ESP_LOGI(TAG, "📥 First chunk received: %d bytes", message.payload_size);
-                ESP_LOG_BUFFER_HEX_LEVEL(TAG, message.payload, 
-                                        message.payload_size > 128 ? 128 : message.payload_size, 
+                ESP_LOGI(TAG, "First chunk received: %d bytes", message.payload_size);
+                ESP_LOG_BUFFER_HEX_LEVEL(TAG, message.payload,
+                                        message.payload_size > 64 ? 64 : message.payload_size,
                                         ESP_LOG_DEBUG);
-                
-                // Locate the ESP32 binary within the Zigbee OTA file.
-                // The OTA file layout is deterministic:
-                //   [56-byte Zigbee OTA base header] +
-                //   [6-byte subelement header: 2-byte tag + 4-byte length] +
-                //   [ESP32 binary starting with magic byte 0xE9]
-                // Searching for 0xE9 from offset 0 is wrong because the byte value 0xE9
-                // can appear inside the header (e.g. as part of the total image size field).
-                // The Zigbee OTA spec defines the base header as exactly 56 bytes (ZCL
-                // Table 11-2), so the binary always starts at offset 62.
-                #define ZIGBEE_OTA_HEADER_SIZE     56
-                #define ZIGBEE_OTA_SUBELEMENT_HDR   6
-                #define ZIGBEE_OTA_DATA_OFFSET     (ZIGBEE_OTA_HEADER_SIZE + ZIGBEE_OTA_SUBELEMENT_HDR)
-                int magic_offset = -1;
-                if (message.payload_size > ZIGBEE_OTA_DATA_OFFSET &&
-                    message.payload[ZIGBEE_OTA_DATA_OFFSET] == 0xE9) {
-                    magic_offset = ZIGBEE_OTA_DATA_OFFSET;
-                    ESP_LOGI(TAG, "✅ Found ESP32 magic byte (0xE9) at expected offset %d", magic_offset);
-                } else {
-                    // Fallback: search after the header in case of non-standard layout
-                    for (int i = ZIGBEE_OTA_HEADER_SIZE; i < message.payload_size && i < 256; i++) {
-                        if (message.payload[i] == 0xE9) {
-                            magic_offset = i;
-                            ESP_LOGW(TAG, "⚠️ Found ESP32 magic byte (0xE9) at non-standard offset %d", magic_offset);
-                            break;
-                        }
-                    }
-                }
-                
-                if (magic_offset >= 0) {
-                    // Found the ESP32 binary, skip everything before it
-                    ESP_LOGI(TAG, "⏩ Skipping %d bytes of OTA header", magic_offset);
-                    ESP_LOGI(TAG, "💾 Writing %d bytes from first chunk", 
-                             message.payload_size - magic_offset);
-                    
-                    int64_t write_start = esp_timer_get_time();
-                    ret = esp_ota_write(update_handle, message.payload + magic_offset, 
-                                      message.payload_size - magic_offset);
-                    int64_t write_time_us = esp_timer_get_time() - write_start;
-                    
-                    total_received += message.payload_size - magic_offset;
-                    ESP_LOGI(TAG, "✅ First chunk written in %lld us. Total: %ld bytes", 
-                             write_time_us, total_received);
-                } else {
-                    ESP_LOGE(TAG, "❌ No ESP32 magic byte (0xE9) found in first %d bytes", 
-                             message.payload_size);
-                    ESP_LOGE(TAG, "Cannot proceed with OTA update");
+
+                if (!message.payload || message.payload_size <= OTA_SUBELEMENT_HDR_LEN) {
+                    ESP_LOGE(TAG, "First chunk too small (%d bytes)", message.payload_size);
                     ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
                     return ESP_ERR_INVALID_ARG;
                 }
-            } else {
-                // Subsequent chunks - write directly
-                ESP_LOGI(TAG, "📦 OTA chunk #%ld received: %d bytes", 
-                         (total_received / message.payload_size) + 1, message.payload_size);
-                
-                int64_t write_start = esp_timer_get_time();
-                ret = esp_ota_write(update_handle, message.payload, message.payload_size);
-                int64_t write_time_us = esp_timer_get_time() - write_start;
-                
-                total_received += message.payload_size;
-                
-                ESP_LOGI(TAG, "✅ Chunk written in %lld us. Total: %ld bytes (%.1f%%)",
-                         write_time_us, total_received,
-                         total_image_size > 0 ? (float)total_received / (float)total_image_size * 100.0f : 0.0f);
-                
-                /* CRITICAL: Yield to prevent blocking Zigbee stack
-                 * The OTA callback runs in Zigbee context. If we block too long,
-                 * the device can't respond to coordinator polls and will timeout.
-                 * Give other tasks a chance to run after each chunk. */
-                if (write_time_us > 10000) {  // If write took > 10ms
-                    ESP_LOGW(TAG, "⚠️ Slow write detected (%lld us) - yielding to Zigbee stack", write_time_us);
-                    taskYIELD();  // Let Zigbee task run
+
+                uint16_t tag_id = *(const uint16_t *)message.payload;
+                uint32_t element_len = *(const uint32_t *)(message.payload + 2);
+                ESP_LOGI(TAG, "Sub-element tag: 0x%04X, length: %ld", tag_id, element_len);
+
+                write_ptr += OTA_SUBELEMENT_HDR_LEN;
+                write_len -= OTA_SUBELEMENT_HDR_LEN;
+
+                if (write_ptr[0] == 0xE9) {
+                    ESP_LOGI(TAG, "ESP32 image magic byte (0xE9) confirmed at sub-element data start");
+                } else {
+                    ESP_LOGW(TAG, "Expected ESP32 magic 0xE9 but got 0x%02X — writing anyway", write_ptr[0]);
                 }
             }
-            
+
+            int64_t write_start = esp_timer_get_time();
+            ret = esp_ota_write(update_handle, write_ptr, write_len);
+            int64_t write_time_us = esp_timer_get_time() - write_start;
+
+            total_received += message.payload_size;
+
+            ESP_LOGI(TAG, "Chunk written: %d bytes in %lld us. Progress: %ld/%ld (%.1f%%)",
+                     write_len, write_time_us, total_received, total_image_size,
+                     total_image_size > 0 ? (float)total_received / (float)total_image_size * 100.0f : 0.0f);
+
+            /* Yield to prevent blocking Zigbee stack on slow flash writes */
+            if (write_time_us > 10000) {
+                ESP_LOGW(TAG, "Slow write (%lld us) - yielding", write_time_us);
+                taskYIELD();
+            }
+
             if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "❌ esp_ota_write failed: %s", esp_err_to_name(ret));
+                ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(ret));
                 ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
-                /* CRITICAL: Release PM lock on write error */
                 if (ota_pm_lock != NULL) {
                     esp_pm_lock_release(ota_pm_lock);
-                    ESP_LOGW(TAG, "🔓 PM lock released after write error");
+                    ESP_LOGW(TAG, "PM lock released after write error");
                 }
-
-
                 ota_transfer_active = false;
                 return ret;
             }
-            
-            // Log progress milestones
-            static uint32_t last_milestone = 0;
-            uint32_t current_milestone = total_received / 100000; // Every 100KB
-            if (current_milestone > last_milestone) {
-                ESP_LOGI(TAG, "📊 OTA progress milestone: %ld KB written", total_received / 1000);
-                last_milestone = current_milestone;
-            }
             break;
+        }
 
         case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_APPLY:
             ESP_LOGI(TAG, "=== OTA UPGRADE APPLY ===");
@@ -391,13 +351,14 @@ esp_err_t zb_ota_query_image_resp_handler(esp_zb_zcl_ota_upgrade_query_image_res
     esp_err_t ret = ESP_OK;
 
     if (message.info.status == ESP_ZB_ZCL_STATUS_SUCCESS) {
-        ESP_LOGI(TAG, "📦 OTA image available: version 0x%lx, size %ld bytes",
+        ESP_LOGI(TAG, "OTA image available: version 0x%lx, size %ld bytes",
                  message.file_version, message.image_size);
-        ret = ESP_OK;
+        ESP_LOGI(TAG, "Approving OTA image upgrade");
     } else {
-        ESP_LOGD(TAG, "No OTA image available or query failed");
-        ret = ESP_FAIL;
+        ESP_LOGD(TAG, "No OTA image available (status: 0x%x)", message.info.status);
     }
+    /* Always return ESP_OK — returning ESP_FAIL aborts the OTA state machine.
+     * A "no image" response is normal and should not be treated as fatal. */
 
     return ret;
 }
@@ -425,14 +386,13 @@ uint32_t esp_zb_ota_get_fw_version(void)
     uint32_t version = 0;
     if (app_desc) {
         int major = 0, minor = 0, patch = 0;
-        // Only parse if string is in semver format, else fallback to 0x01000000
-        if (sscanf(app_desc->version, "%d.%d.%d", &major, &minor, &patch) == 3) {
+        int matched = sscanf(app_desc->version, "%d.%d.%d", &major, &minor, &patch);
+        if (matched >= 2) {
             version = ((major & 0xFF) << 24) | ((minor & 0xFF) << 16) | (patch & 0xFFFF);
-            ESP_LOGI(TAG, "Firmware version: %s (0x%08lX)", app_desc->version, version);
+            ESP_LOGI(TAG, "Firmware version: %s (0x%08lX)", app_desc->version, (unsigned long)version);
         } else {
-            // Fallback: use 1.0.0 if not a semver string
             version = 0x01000000;
-            ESP_LOGW(TAG, "Firmware version string not semver: '%s', using fallback 1.0.0 (0x01000000)", app_desc->version);
+            ESP_LOGW(TAG, "Cannot parse version '%s', using fallback 0x01000000", app_desc->version);
         }
     }
     return version;
