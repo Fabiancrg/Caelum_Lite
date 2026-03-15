@@ -147,6 +147,7 @@ esp_err_t sensor_read_humidity(float *out_percent)
 {
     if (!out_percent) return ESP_ERR_INVALID_ARG;
     if (detected == SENSOR_TYPE_BME280) {
+        if (bme280_app_is_bmp280()) return ESP_ERR_NOT_SUPPORTED;
         return bme280_app_read_humidity(out_percent);
     } else if (detected == SENSOR_TYPE_SHT41) {
         return sht41_read_humidity(out_percent);

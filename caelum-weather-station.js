@@ -16,7 +16,7 @@ export default {
                 reporting: {min: 10, max: 3600, change: 0.1},
             }
         ),
-        m.humidity(),
+        m.humidity({endpointNames: ["1"]}),
         m.pressure(
             {
                 endpointNames: ["1"],
