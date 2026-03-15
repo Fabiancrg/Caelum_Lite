@@ -354,7 +354,7 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
 
         case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ABORT:
             ESP_LOGW(TAG, "OTA upgrade aborted by coordinator");
-            /* Fall through to ERROR cleanup */
+            __attribute__((fallthrough));
 
         case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR:
             ESP_LOGE(TAG, "✗ OTA upgrade %s", message.upgrade_status == ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ABORT ? "aborted" : "error");
