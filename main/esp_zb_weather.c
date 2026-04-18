@@ -75,8 +75,12 @@ static bool zigbee_network_connected = false;
 
 /* Sleep prevention during initial configuration
  * Prevents device from sleeping for 60 seconds after joining network
- * This gives coordinator (Z2M) time to configure reporting without interruption */
+ * This gives coordinator (Z2M) time to configure reporting without interruption.
+ * IMPORTANT: We use a PM lock instead of skipping esp_zb_sleep_now() — the Zigbee
+ * stack requires that esp_zb_sleep_now() is ALWAYS called on CAN_SLEEP, otherwise
+ * the internal critical section nesting becomes unbalanced and causes a crash. */
 static int64_t network_join_time_us = 0;
+static esp_pm_lock_handle_t config_pm_lock = NULL;
 #define INITIAL_CONFIG_DELAY_SEC 60  // Wait 60 seconds before allowing sleep after join
 
 /* LED is used only during boot/join process:
@@ -640,9 +644,13 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             connection_retry_count = 0;
             backoff_attempt = 0;
             
-            /* Record join time to prevent sleep during initial configuration */
+            /* Prevent light sleep during initial configuration period.
+             * Acquire PM lock so esp_zb_sleep_now() becomes a no-op (fast polling). */
             network_join_time_us = esp_timer_get_time();
-            ESP_LOGI(TAG, "🕐 Network join time recorded - sleep disabled for %d seconds to allow reporting configuration", INITIAL_CONFIG_DELAY_SEC);
+            if (config_pm_lock != NULL) {
+                esp_pm_lock_acquire(config_pm_lock);
+                ESP_LOGI(TAG, "PM lock acquired - sleep blocked for %d seconds for initial config", INITIAL_CONFIG_DELAY_SEC);
+            }
             
             /* Enable rain gauge now that we're connected */
             rain_gauge_enable_isr();
@@ -720,29 +728,23 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         }
         break;
     case ESP_ZB_COMMON_SIGNAL_CAN_SLEEP:
-        /* During OTA: let esp_zb_sleep_now() run normally. The PM lock
-         * prevents actual light sleep, so the stack "wakes up" immediately
-         * and polls the parent for the next OTA chunk — fast polling. */
-        
-        /* Prevent sleep during initial configuration period after network join
-         * This allows coordinator (Z2M) to configure reporting without interruption */
+        /* CRITICAL: Always call esp_zb_sleep_now() — skipping it unbalances the
+         * stack's internal critical sections and causes a vPortExitCritical crash.
+         * PM locks prevent actual light sleep when we need to stay awake. */
+
+        /* Release config PM lock once the initial configuration period expires */
         if (network_join_time_us > 0) {
             int64_t time_since_join_us = esp_timer_get_time() - network_join_time_us;
             int64_t config_period_us = (int64_t)INITIAL_CONFIG_DELAY_SEC * 1000000LL;
-            
-            if (time_since_join_us < config_period_us) {
-                int remaining_sec = (int)((config_period_us - time_since_join_us) / 1000000LL);
-                ESP_LOGD(TAG, "⏳ Preventing sleep during initial config period (%d sec remaining)", remaining_sec);
-                /* Don't sleep - let coordinator configure device */
-                break;
-            } else {
-                /* Configuration period complete - allow sleep from now on */
-                ESP_LOGI(TAG, "✅ Initial configuration period complete - sleep now enabled");
-                network_join_time_us = 0;  // Clear flag so we don't check again
+
+            if (time_since_join_us >= config_period_us) {
+                if (config_pm_lock != NULL) {
+                    esp_pm_lock_release(config_pm_lock);
+                    ESP_LOGI(TAG, "Initial config period complete - PM lock released, sleep enabled");
+                }
+                network_join_time_us = 0;
             }
         }
-        
-        /* LED is already deinitialized after successful join - no action needed */
 
         esp_zb_sleep_now();
         break;
@@ -887,15 +889,15 @@ static void esp_zb_task(void *pvParameters)
     // Initialize Zigbee stack as Sleepy End Device (SED)
     esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZED_CONFIG();
     
-    // Configure as Sleepy End Device for low power operation 
+    // Configure as Sleepy End Device for low power operation
     zb_nwk_cfg.nwk_cfg.zed_cfg.ed_timeout = ZIGBEE_ED_TIMEOUT;
     zb_nwk_cfg.nwk_cfg.zed_cfg.keep_alive = ZIGBEE_KEEP_ALIVE_MS;
-    
-    /* CRITICAL: Initialize stack FIRST, then enable sleep */
-    esp_zb_init(&zb_nwk_cfg);
-    
-    /* Enable zigbee light sleep - MUST be called AFTER esp_zb_init() */
+
+    /* CRITICAL: Enable sleep BEFORE esp_zb_init() — the ZBOSS stack sets up
+     * internal critical section state for sleep during init. Enabling after
+     * causes unbalanced vPortEnterCritical/vPortExitCritical in MAC iteration. */
     esp_zb_sleep_enable(true);
+    esp_zb_init(&zb_nwk_cfg);
     
     /* Configure device as Sleepy End Device (rx_on_when_idle = false) */
     esp_zb_set_rx_on_when_idle(false);
@@ -2261,6 +2263,12 @@ void app_main(void)
     
     /* Initialize OTA */
     ESP_ERROR_CHECK(esp_zb_ota_init());
+
+    /* Create PM lock for initial config period (prevents sleep after network join) */
+    if (esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "config_no_sleep", &config_pm_lock) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to create config PM lock");
+        config_pm_lock = NULL;
+    }
     
     /* Initialize power management for light sleep */
     ESP_ERROR_CHECK(esp_zb_power_save_init());
