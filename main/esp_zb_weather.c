@@ -530,15 +530,10 @@ static void configure_analog_input_reporting(uint8_t param)
     rain_report_cmd.record_number = 1;
     rain_report_cmd.record_field = &rain_record;
     
-    // Use 5-second timeout to prevent deadlock
-    if (esp_zb_lock_acquire(pdMS_TO_TICKS(5000)) == ESP_OK) {
-        esp_zb_zcl_config_report_cmd_req(&rain_report_cmd);
-        esp_zb_lock_release();
-        ESP_LOGI(RAIN_TAG, "📋 Rain gauge reporting configured: change=%.1f mm, max_interval=3600s", rain_reportable_change);
-    } else {
-        ESP_LOGW(RAIN_TAG, "Failed to acquire Zigbee lock for rain gauge reporting config (timeout)");
-    }
-    
+    // Called from Zigbee scheduler alarm - no lock needed (already in Zigbee task context)
+    esp_zb_zcl_config_report_cmd_req(&rain_report_cmd);
+    ESP_LOGI(RAIN_TAG, "📋 Rain gauge reporting configured: change=%.1f mm, max_interval=3600s", rain_reportable_change);
+
     /* Configure reporting for EP3 (pulse counter) */
     esp_zb_zcl_config_report_cmd_t pulse_report_cmd = {0};
     pulse_report_cmd.zcl_basic_cmd.dst_addr_u.addr_short = esp_zb_get_short_address();  // Send to self
@@ -546,7 +541,7 @@ static void configure_analog_input_reporting(uint8_t param)
     pulse_report_cmd.zcl_basic_cmd.src_endpoint = HA_ESP_PULSE_COUNTER_ENDPOINT;
     pulse_report_cmd.address_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
     pulse_report_cmd.clusterID = ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT;
-    
+
     esp_zb_zcl_config_report_record_t pulse_record = {
         .direction = ESP_ZB_ZCL_REPORT_DIRECTION_SEND,
         .attributeID = ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
@@ -557,15 +552,10 @@ static void configure_analog_input_reporting(uint8_t param)
     };
     pulse_report_cmd.record_number = 1;
     pulse_report_cmd.record_field = &pulse_record;
-    
-    // Use 5-second timeout to prevent deadlock
-    if (esp_zb_lock_acquire(pdMS_TO_TICKS(5000)) == ESP_OK) {
-        esp_zb_zcl_config_report_cmd_req(&pulse_report_cmd);
-        esp_zb_lock_release();
-        ESP_LOGI(PULSE_TAG, "📋 Pulse counter reporting configured: change=%.1f, max_interval=3600s", pulse_reportable_change);
-    } else {
-        ESP_LOGW(PULSE_TAG, "Failed to acquire Zigbee lock for pulse counter reporting config (timeout)");
-    }
+
+    // Called from Zigbee scheduler alarm - no lock needed (already in Zigbee task context)
+    esp_zb_zcl_config_report_cmd_req(&pulse_report_cmd);
+    ESP_LOGI(PULSE_TAG, "📋 Pulse counter reporting configured: change=%.1f, max_interval=3600s", pulse_reportable_change);
 }
 
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
@@ -674,7 +664,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             rain_gauge_request_flush(false, true);
             // Queue pulse counter flush to publish current total after network join
             pulse_counter_request_flush(false, true);
-            esp_zb_scheduler_alarm((esp_zb_callback_t)battery_read_and_report, 0, 4000); // Update in 4 seconds
+            // Battery is read by sensor_read_task (triggered above via initial_sensor_read_trigger)
             
             /* Start periodic sensor reading timer for 15-minute intervals.
              * This ensures sensors are read regularly and attributes stay updated.
@@ -1421,12 +1411,17 @@ static void bme280_read_and_report(uint8_t param)
     ret = sensor_read_temperature(&temperature);
     if (ret == ESP_OK) {
         int16_t temp_centidegrees = (int16_t)(temperature * 100);
-        ret = esp_zb_zcl_set_attribute_val(HA_ESP_BME280_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
-                                           ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
-                                           &temp_centidegrees, force_report);
+        if (esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+            ret = esp_zb_zcl_set_attribute_val(HA_ESP_BME280_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+                                               ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
+                                               &temp_centidegrees, force_report);
+            esp_zb_lock_release();
+        } else {
+            ret = ESP_FAIL;
+        }
         if (ret == ESP_OK) {
             ESP_LOGI(TAG, "🌡️ Temperature: %.2f°C (attribute updated)", temperature);
-            
+
             static float last_logged_temp = -999.0f;
             if (fabsf(temperature - last_logged_temp) > 0.5f) {
                 last_logged_temp = temperature;
@@ -1442,12 +1437,17 @@ static void bme280_read_and_report(uint8_t param)
     ret = sensor_read_humidity(&humidity);
     if (ret == ESP_OK) {
         uint16_t hum_centipercent = (uint16_t)(humidity * 100);
-        ret = esp_zb_zcl_set_attribute_val(HA_ESP_BME280_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT,
-                                           ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID,
-                                           &hum_centipercent, force_report);
+        if (esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+            ret = esp_zb_zcl_set_attribute_val(HA_ESP_BME280_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT,
+                                               ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID,
+                                               &hum_centipercent, force_report);
+            esp_zb_lock_release();
+        } else {
+            ret = ESP_FAIL;
+        }
         if (ret == ESP_OK) {
             ESP_LOGI(TAG, "💧 Humidity: %.2f%% (attribute updated)", humidity);
-            
+
             static float last_logged_hum = -999.0f;
             if (fabsf(humidity - last_logged_hum) > 2.0f) {
                 last_logged_hum = humidity;
@@ -1465,9 +1465,14 @@ static void bme280_read_and_report(uint8_t param)
     ret = sensor_read_pressure(&pressure);
     if (ret == ESP_OK) {
         int16_t pressure_zigbee = (int16_t)(pressure * 10); // hPa -> 0.1 kPa units
-        ret = esp_zb_zcl_set_attribute_val(HA_ESP_BME280_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT,
-                                           ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_VALUE_ID,
-                                           &pressure_zigbee, force_report);
+        if (esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+            ret = esp_zb_zcl_set_attribute_val(HA_ESP_BME280_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT,
+                                               ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_VALUE_ID,
+                                               &pressure_zigbee, force_report);
+            esp_zb_lock_release();
+        } else {
+            ret = ESP_FAIL;
+        }
         if (ret == ESP_OK) {
             ESP_LOGI(TAG, "🌪️  Pressure: %.2f hPa (raw: %d x0.1kPa - attribute updated)", pressure, pressure_zigbee);
         } else {
@@ -1755,6 +1760,10 @@ static void rain_gauge_flush_totals(bool save_to_nvs, bool update_attribute)
             return;
         }
 
+        if (!esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+            ESP_LOGW(RAIN_TAG, "Failed to acquire Zigbee lock for rain attribute update");
+            return;
+        }
         esp_err_t ret = esp_zb_zcl_set_attribute_val(
             HA_ESP_RAIN_GAUGE_ENDPOINT,
             ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
@@ -1762,6 +1771,7 @@ static void rain_gauge_flush_totals(bool save_to_nvs, bool update_attribute)
             ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
             &rounded_rainfall,
             false);
+        esp_zb_lock_release();
 
         if (ret == ESP_OK) {
             ESP_LOGI(RAIN_TAG, "📡 Rain gauge attribute updated: %.2f mm (%u pulses)", rounded_rainfall, rain_pulse_count);
@@ -1986,20 +1996,23 @@ static void battery_read_and_report(uint8_t param)
                     nvs_close(nvs_handle);
                 }
                 // Update Zigbee attributes with last known values
-                esp_zb_zcl_set_attribute_val(
-                    HA_ESP_BME280_ENDPOINT,
-                    ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-                    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                    0x0020,
-                    &zigbee_voltage,
-                    force_report);
-                esp_zb_zcl_set_attribute_val(
-                    HA_ESP_BME280_ENDPOINT,
-                    ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-                    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                    0x0021,
-                    &zigbee_percentage,
-                    force_report);
+                if (esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+                    esp_zb_zcl_set_attribute_val(
+                        HA_ESP_BME280_ENDPOINT,
+                        ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+                        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                        0x0020,
+                        &zigbee_voltage,
+                        force_report);
+                    esp_zb_zcl_set_attribute_val(
+                        HA_ESP_BME280_ENDPOINT,
+                        ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+                        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                        0x0021,
+                        &zigbee_percentage,
+                        force_report);
+                    esp_zb_lock_release();
+                }
                 ESP_LOGI(BATTERY_TAG, "🔁 Restored battery values from NVS: %.2fV (%.0f%%) - Zigbee: %u, %u",
                          battery_voltage, percentage, zigbee_voltage, zigbee_percentage);
                 return;  // Skip this reading
@@ -2088,29 +2101,33 @@ skip_adc:
         nvs_commit(nvs_handle);
         nvs_close(nvs_handle);
     }
-    // Update battery voltage attribute (0x0020)
-    esp_err_t ret = esp_zb_zcl_set_attribute_val(
-        HA_ESP_BME280_ENDPOINT,
-        ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-        0x0020,  // Battery Voltage attribute ID
-        &zigbee_voltage,
-        force_report
-    );
-    if (ret != ESP_OK) {
-        ESP_LOGE(BATTERY_TAG, "❌ Failed to update battery voltage: %s", esp_err_to_name(ret));
-    }
-    // Update battery percentage attribute (0x0021)
-    ret = esp_zb_zcl_set_attribute_val(
-        HA_ESP_BME280_ENDPOINT,
-        ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-        0x0021,  // Battery Percentage Remaining attribute ID
-        &zigbee_percentage,
-        force_report
-    );
-    if (ret != ESP_OK) {
-        ESP_LOGE(BATTERY_TAG, "❌ Failed to update battery percentage: %s", esp_err_to_name(ret));
+    // Update battery voltage (0x0020) and percentage (0x0021) attributes
+    if (esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+        esp_err_t ret = esp_zb_zcl_set_attribute_val(
+            HA_ESP_BME280_ENDPOINT,
+            ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+            ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+            0x0020,
+            &zigbee_voltage,
+            force_report
+        );
+        if (ret != ESP_OK) {
+            ESP_LOGE(BATTERY_TAG, "❌ Failed to update battery voltage: %s", esp_err_to_name(ret));
+        }
+        ret = esp_zb_zcl_set_attribute_val(
+            HA_ESP_BME280_ENDPOINT,
+            ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+            ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+            0x0021,
+            &zigbee_percentage,
+            force_report
+        );
+        if (ret != ESP_OK) {
+            ESP_LOGE(BATTERY_TAG, "❌ Failed to update battery percentage: %s", esp_err_to_name(ret));
+        }
+        esp_zb_lock_release();
+    } else {
+        ESP_LOGW(BATTERY_TAG, "Failed to acquire Zigbee lock for battery attribute update");
     }
     ESP_LOGI(BATTERY_TAG, "🔋 Li-Ion Battery: %.2fV (%.0f%%) (attributes updated)",
              battery_voltage, percentage);
@@ -2487,6 +2504,10 @@ static void pulse_counter_flush_totals(bool save_to_nvs, bool update_attribute)
             return;
         }
 
+        if (!esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+            ESP_LOGW(PULSE_TAG, "Failed to acquire Zigbee lock for pulse attribute update");
+            return;
+        }
         esp_err_t ret = esp_zb_zcl_set_attribute_val(
             HA_ESP_PULSE_COUNTER_ENDPOINT,
             ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
@@ -2494,6 +2515,7 @@ static void pulse_counter_flush_totals(bool save_to_nvs, bool update_attribute)
             ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
             &rounded_pulse_value,
             false);
+        esp_zb_lock_release();
 
         if (ret == ESP_OK) {
             ESP_LOGI(PULSE_TAG, "📡 Pulse counter attribute updated: %.2f (%u pulses)", rounded_pulse_value, pulse_counter_count);
@@ -2952,9 +2974,13 @@ static void ds18b20_read_and_report(uint8_t param)
     ESP_LOGD(DS18B20_TAG, "Updating Zigbee attribute: %d (0.01°C units)", temp_centidegrees);
     
     /* Update Zigbee attribute (false = don't force report, let coordinator config decide) */
-    esp_err_t ret = esp_zb_zcl_set_attribute_val(HA_ESP_DS18B20_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
-                                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
-                                                  &temp_centidegrees, false);
+    esp_err_t ret = ESP_FAIL;
+    if (esp_zb_lock_acquire(pdMS_TO_TICKS(1000))) {
+        ret = esp_zb_zcl_set_attribute_val(HA_ESP_DS18B20_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+                                           ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
+                                           &temp_centidegrees, false);
+        esp_zb_lock_release();
+    }
     if (ret == ESP_OK) {
         ESP_LOGI(DS18B20_TAG, "✅ DS18B20 Temperature: %.2f°C (attribute updated)", temperature);
     } else {
