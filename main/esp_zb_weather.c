@@ -2679,23 +2679,28 @@ static void pulse_counter_init(void)
 #define DS18B20_CMD_CONVERT_T       0x44
 #define DS18B20_CMD_READ_SCRATCHPAD 0xBE
 
+/* Spinlock protecting µs-level 1-Wire time slots from interrupt preemption */
+static portMUX_TYPE ds18b20_mux = portMUX_INITIALIZER_UNLOCKED;
+
 /**
  * @brief 1-Wire reset pulse - pull bus low for 480us, wait for presence pulse
  * @return true if device present, false otherwise
  */
 static bool ds18b20_reset(void)
 {
-    /* Pull bus low for reset pulse */
+    /* Pull bus low for reset pulse - long enough that interrupt extension is safe */
     gpio_set_level(DS18B20_GPIO, 0);
     esp_rom_delay_us(480);  // Reset pulse (480-960us)
-    
-    /* Release bus and wait for presence pulse */
-    gpio_set_level(DS18B20_GPIO, 1);  // Release (open-drain + pull-up = high)
-    esp_rom_delay_us(70);   // Wait for presence pulse (60-240us)
-    
+
+    /* Presence-detection window is tight: sample between 60-240us after release.
+     * Disable interrupts so a stray ISR can't push us past the window. */
+    portENTER_CRITICAL(&ds18b20_mux);
+    gpio_set_level(DS18B20_GPIO, 1);
+    esp_rom_delay_us(70);
     int level = gpio_get_level(DS18B20_GPIO);
-    esp_rom_delay_us(410);  // Complete reset cycle
-    
+    portEXIT_CRITICAL(&ds18b20_mux);
+
+    esp_rom_delay_us(410);  // Complete reset cycle (outside critical section)
     return (level == 0);  // Device pulls line low if present
 }
 
@@ -2704,17 +2709,22 @@ static bool ds18b20_reset(void)
  */
 static void ds18b20_write_bit(uint8_t bit)
 {
-    /* Pull bus low to start time slot */
-    gpio_set_level(DS18B20_GPIO, 0);
-    
+    /* The critical window is the low-pulse duration (1-15us for '1', 60-120us for '0').
+     * Hold interrupts off for the pulse only; release before the recovery delay. */
     if (bit) {
-        esp_rom_delay_us(6);   // Write 1: short low pulse
-        gpio_set_level(DS18B20_GPIO, 1);  // Release bus early
-        esp_rom_delay_us(64);
+        portENTER_CRITICAL(&ds18b20_mux);
+        gpio_set_level(DS18B20_GPIO, 0);
+        esp_rom_delay_us(6);
+        gpio_set_level(DS18B20_GPIO, 1);
+        portEXIT_CRITICAL(&ds18b20_mux);
+        esp_rom_delay_us(64);   // Recovery (outside critical section)
     } else {
-        esp_rom_delay_us(60);  // Write 0: long low pulse
-        gpio_set_level(DS18B20_GPIO, 1);  // Release bus at end
-        esp_rom_delay_us(10);
+        portENTER_CRITICAL(&ds18b20_mux);
+        gpio_set_level(DS18B20_GPIO, 0);
+        esp_rom_delay_us(60);
+        gpio_set_level(DS18B20_GPIO, 1);
+        portEXIT_CRITICAL(&ds18b20_mux);
+        esp_rom_delay_us(10);   // Recovery (outside critical section)
     }
 }
 
@@ -2723,17 +2733,18 @@ static void ds18b20_write_bit(uint8_t bit)
  */
 static uint8_t ds18b20_read_bit(void)
 {
-    /* Pull bus low briefly to start read slot */
+    /* The DS18B20 must be sampled within 15us of the falling edge.
+     * Any interrupt firing between the low pulse and the sample corrupts the bit.
+     * Keep the critical window to just the 13us that matter; recovery is outside. */
+    portENTER_CRITICAL(&ds18b20_mux);
     gpio_set_level(DS18B20_GPIO, 0);
     esp_rom_delay_us(3);
-    
-    /* Release bus and sample */
     gpio_set_level(DS18B20_GPIO, 1);
     esp_rom_delay_us(10);
-    
     uint8_t bit = gpio_get_level(DS18B20_GPIO);
-    esp_rom_delay_us(53);
-    
+    portEXIT_CRITICAL(&ds18b20_mux);
+
+    esp_rom_delay_us(53);  // Slot recovery (outside critical section)
     return bit;
 }
 
